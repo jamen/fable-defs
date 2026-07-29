@@ -24,8 +24,17 @@
               "rust-src"
               "rust-analyzer"
             ];
+            targets = [
+              "x86_64-pc-windows-gnu"
+            ];
           })
+          pkgsCross.mingwW64.stdenv.cc
+          pkgsCross.mingwW64.windows.pthreads
         ];
+
+        shellHook = ''
+          export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc
+        '';
       };
     };
 }
