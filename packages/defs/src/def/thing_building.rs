@@ -1,12 +1,8 @@
 use crate::DefStruct;
 use crate::def::{
-    enums::ReverbEnvironmentType,
-    values::EngineGraphic,
-    values::ThingComponentSet,
-    wire::DefIndex,
+    enums::ReverbEnvironmentType, values::EngineGraphic, values::ThingComponentSet, wire::DefIndex,
     wire::DefString,
 };
-
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]
 pub struct ThingBuildingDef {

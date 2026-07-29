@@ -32,7 +32,8 @@ pub struct HeroMarriageDef {
     #[def("ChanceThatGiftWillBeGiven")]
     pub chance_that_gift_will_be_given: f32,
     #[def("AmountOfGoldPerHourOfMarriageToIncreaseGiftGivingPriceValuePerHourOfPlay")]
-    pub amount_of_gold_per_hour_of_marriage_to_increase_gift_giving_price_value_per_hour_of_play: f32,
+    pub amount_of_gold_per_hour_of_marriage_to_increase_gift_giving_price_value_per_hour_of_play:
+        f32,
     #[def("MaxNumHoursOfMarriageToIncreaseGiftGivingPriceValue")]
     pub max_num_hours_of_marriage_to_increase_gift_giving_price_value: f32,
     #[def("MultiplierForGiftGivingValueEveryOpportunity")]

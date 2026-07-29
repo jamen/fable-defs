@@ -1,7 +1,8 @@
 use crate::bytes::{TakeError, TakeNullTerminatedUtf8, take, take_null_terminated_utf8};
 use crate::bytes::{put, put_bytes, put_null_terminated_utf8};
+use crate::crc32;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs::File,
     io::{self, BufReader, Read},
     path::Path,
@@ -23,7 +24,9 @@ pub enum NamesError {
 }
 
 impl From<io::Error> for NamesError {
-    fn from(e: io::Error) -> Self { NamesError::Io(e) }
+    fn from(e: io::Error) -> Self {
+        NamesError::Io(e)
+    }
 }
 
 #[derive(Debug)]
@@ -64,9 +67,8 @@ impl Names {
         while !bytes_cursor.is_empty() {
             let offset = bytes.len() - bytes_cursor.len();
 
-            let entry =
-                NamesEntry::parse(bytes_cursor)
-                    .map_err(|error| NamesError::ParseEntry(offset, error))?;
+            let entry = NamesEntry::parse(bytes_cursor)
+                .map_err(|error| NamesError::ParseEntry(offset, error))?;
 
             let string_offset = (offset + 4 - 20) as u32;
 
@@ -89,6 +91,72 @@ impl Names {
         out
     }
 }
+
+// ── NamesBuilder ───────────────────────────────────────────────────────────
+
+/// Incrementally builds a [`Names`] table, interning strings as they are
+/// encountered during compilation and assigning each a stable byte offset.
+///
+/// All three binaries share one instance — `names.bin` is a single table.
+pub struct NamesBuilder {
+    map: BTreeMap<u32, NamesEntry>,
+    off_of: HashMap<String, u32>,
+    pos: usize,
+}
+
+impl Default for NamesBuilder {
+    fn default() -> Self {
+        Self {
+            map: BTreeMap::new(),
+            off_of: HashMap::new(),
+            pos: 20,
+        }
+    }
+}
+
+impl NamesBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Intern `s` into the table, returning its byte offset (relative to the
+    /// content region, i.e. after the 20-byte header). Idempotent — repeated
+    /// calls with the same string return the same offset.
+    pub fn intern(&mut self, s: &str) -> u32 {
+        if let Some(&o) = self.off_of.get(s) {
+            return o;
+        }
+        let off = (self.pos + 4 - 20) as u32;
+        self.map.insert(
+            off,
+            NamesEntry {
+                crc: crc32::crc(s.as_bytes()),
+                string: s.to_string(),
+            },
+        );
+        self.off_of.insert(s.to_string(), off);
+        self.pos += 4 + s.len() + 1;
+        off
+    }
+
+    /// Consume the builder and produce a [`Names`] with the given 20-byte
+    /// header. The header's `StringCount` (off8) and `StreamLength` (off12)
+    /// are computed from the built map.
+    pub fn finalize(self, header_bytes: [u8; 20]) -> Names {
+        let mut names = Names {
+            header_bytes,
+            map: self.map,
+        };
+        let bytes = names.to_bytes();
+        let string_count = names.map.len() as u32;
+        let stream_len = (bytes.len() - 16) as u32;
+        names.header_bytes[8..12].copy_from_slice(&string_count.to_le_bytes());
+        names.header_bytes[12..16].copy_from_slice(&stream_len.to_le_bytes());
+        names
+    }
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

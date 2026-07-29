@@ -1,9 +1,5 @@
 use crate::DefStruct;
-use crate::def::{
-    enums::Opinion,
-    wire::VecMap,
-};
-
+use crate::def::{enums::Opinion, wire::VecMap};
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]
 pub struct TargetingDef {

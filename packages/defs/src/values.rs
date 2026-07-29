@@ -5,8 +5,8 @@ use crate::enums::{
     InputKey, MouseButtonControl, ReactionSpeechType, XboxControllerButton,
 };
 use crate::wire::{DefIndex, DefString, PString, VecMap};
-use std::collections::BTreeMap;
 use crate::{DefVariant, WireStruct};
+use std::collections::BTreeMap;
 
 /// C++ `CRGBColour`. The default ctor is opaque black
 /// (`0xFF000000` — alpha 0xFF, rgb 0), which is what retail NULLDEFs store.

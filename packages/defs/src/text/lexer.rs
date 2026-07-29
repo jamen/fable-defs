@@ -226,10 +226,7 @@ impl<'a> Cursor<'a> {
         ParseError::new(at, kind)
     }
 
-    pub fn expect(
-        &mut self,
-        kind: TokenKind,
-    ) -> Result<Token<'a>, ParseError<TextParseErrorKind>> {
+    pub fn expect(&mut self, kind: TokenKind) -> Result<Token<'a>, ParseError<TextParseErrorKind>> {
         if self.at(kind) {
             Ok(self.bump())
         } else {
@@ -240,10 +237,7 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    pub fn expect_ident(
-        &mut self,
-        what: &str,
-    ) -> Result<String, ParseError<TextParseErrorKind>> {
+    pub fn expect_ident(&mut self, what: &str) -> Result<String, ParseError<TextParseErrorKind>> {
         let t = self.peek();
         if t.kind == TokenKind::Ident {
             self.bump();
@@ -441,7 +435,10 @@ impl<'a> Lexer<'a> {
     fn lex_ident_or_keyword(&mut self) -> Token<'a> {
         let start = self.pos;
         self.pos += 1; // first char (letter or `_`)
-        while self.peek().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+        while self
+            .peek()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
             self.pos += 1;
         }
         let kind = match &self.input[start..self.pos] {
@@ -588,14 +585,25 @@ mod tests {
 
     #[test]
     fn number_stops_at_delimiter() {
-        assert_eq!(toks("Time[0]"), vec![(Ident, "Time"), (LBracket, "["), (Number, "0"), (RBracket, "]")]);
+        assert_eq!(
+            toks("Time[0]"),
+            vec![
+                (Ident, "Time"),
+                (LBracket, "["),
+                (Number, "0"),
+                (RBracket, "]")
+            ]
+        );
     }
 
     // --- strings: raw slice incl. quotes --------------------------------------
 
     #[test]
     fn string_keeps_quotes() {
-        assert_eq!(toks(r#""Hello, World!""#), vec![(Str, r#""Hello, World!""#)]);
+        assert_eq!(
+            toks(r#""Hello, World!""#),
+            vec![(Str, r#""Hello, World!""#)]
+        );
     }
 
     #[test]
@@ -650,7 +658,9 @@ mod tests {
     fn constructor_with_args() {
         assert_eq!(
             kinds("CRGBColour(255, 128, 64, 255)"),
-            vec![Ident, LParen, Number, Comma, Number, Comma, Number, Comma, Number, RParen]
+            vec![
+                Ident, LParen, Number, Comma, Number, Comma, Number, Comma, Number, RParen
+            ]
         );
     }
 
@@ -698,8 +708,14 @@ mod tests {
     #[test]
     fn directive_longest_match() {
         // `#definition_template` must win over the `#definition` prefix.
-        assert_eq!(kinds("#definition_template OBJECT T"), vec![DefinitionTemplate, Ident, Ident]);
-        assert_eq!(kinds("#definition OBJECT T"), vec![Definition, Ident, Ident]);
+        assert_eq!(
+            kinds("#definition_template OBJECT T"),
+            vec![DefinitionTemplate, Ident, Ident]
+        );
+        assert_eq!(
+            kinds("#definition OBJECT T"),
+            vec![Definition, Ident, Ident]
+        );
     }
 
     #[test]
@@ -731,7 +747,9 @@ mod tests {
     fn enum_decl() {
         assert_eq!(
             kinds("enum EFoo { A = 1, B = 2 };"),
-            vec![Enum, Ident, LBrace, Ident, Eq, Number, Comma, Ident, Eq, Number, RBrace, Semi]
+            vec![
+                Enum, Ident, LBrace, Ident, Eq, Number, Comma, Ident, Eq, Number, RBrace, Semi
+            ]
         );
     }
 
@@ -750,7 +768,10 @@ mod tests {
 
     #[test]
     fn line_comment_consumed() {
-        assert_eq!(kinds("// just a comment\nHealth 100;"), vec![Ident, Number, Semi]);
+        assert_eq!(
+            kinds("// just a comment\nHealth 100;"),
+            vec![Ident, Number, Semi]
+        );
     }
 
     #[test]
@@ -760,7 +781,10 @@ mod tests {
 
     #[test]
     fn inline_block_comment() {
-        assert_eq!(kinds(r#"Name /* inline */ "Test";"#), vec![Ident, Str, Semi]);
+        assert_eq!(
+            kinds(r#"Name /* inline */ "Test";"#),
+            vec![Ident, Str, Semi]
+        );
     }
 
     #[test]
@@ -801,7 +825,14 @@ mod tests {
     #[test]
     fn only_trivia_yields_eof() {
         for input in ["", "   \n\t  \r\n  ", "// line\n/* block */\n"] {
-            assert_eq!(lex(input).unwrap().into_iter().map(|t| t.kind).collect::<Vec<_>>(), vec![Eof]);
+            assert_eq!(
+                lex(input)
+                    .unwrap()
+                    .into_iter()
+                    .map(|t| t.kind)
+                    .collect::<Vec<_>>(),
+                vec![Eof]
+            );
         }
     }
 
@@ -809,15 +840,24 @@ mod tests {
 
     #[test]
     fn unterminated_string() {
-        assert_eq!(lex_err("Name \"no close\n"), LexErrorKind::UnterminatedString);
+        assert_eq!(
+            lex_err("Name \"no close\n"),
+            LexErrorKind::UnterminatedString
+        );
     }
 
     #[test]
     fn unterminated_block_comment() {
         // A `/*` with real content and no `*/` is a genuine error — only an
         // all-separator line is treated as a decorative banner.
-        assert_eq!(lex_err("Health /* never closes"), LexErrorKind::UnterminatedBlockComment);
-        assert_eq!(lex_err("/* real comment, no closer\nX 1;"), LexErrorKind::UnterminatedBlockComment);
+        assert_eq!(
+            lex_err("Health /* never closes"),
+            LexErrorKind::UnterminatedBlockComment
+        );
+        assert_eq!(
+            lex_err("/* real comment, no closer\nX 1;"),
+            LexErrorKind::UnterminatedBlockComment
+        );
     }
 
     #[test]

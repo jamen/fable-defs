@@ -1,8 +1,5 @@
 use crate::DefStruct;
-use crate::def::{
-    LensFlareElementDef,
-};
-
+use crate::def::LensFlareElementDef;
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]
 pub struct SkyDef {

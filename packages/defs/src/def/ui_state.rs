@@ -32,4 +32,3 @@ pub struct UiStateDef {
     #[def("ChildrenNotAffected")]
     pub children_not_affected: Vec<i32>,
 }
-

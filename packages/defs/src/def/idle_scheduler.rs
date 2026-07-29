@@ -1,8 +1,5 @@
 use crate::DefStruct;
-use crate::def::{
-    enums::IdleStateGroup,
-    wire::VecMap,
-};
+use crate::def::{enums::IdleStateGroup, wire::VecMap};
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]
 pub struct IdleSchedulerDef {

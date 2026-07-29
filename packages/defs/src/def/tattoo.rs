@@ -1,8 +1,5 @@
 use crate::DefStruct;
-use crate::def::{
-    enums::CompositeBlendType,
-};
-
+use crate::def::enums::CompositeBlendType;
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]
 pub struct TattooDef {

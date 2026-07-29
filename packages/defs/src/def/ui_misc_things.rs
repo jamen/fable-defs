@@ -1,10 +1,5 @@
 use crate::DefStruct;
-use crate::def::{
-    values::MapPathEntry,
-    wire::VecMap,
-    wire::WStr,
-};
-
+use crate::def::{values::MapPathEntry, wire::VecMap, wire::WStr};
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]
 pub struct UiMiscThingsDef {

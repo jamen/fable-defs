@@ -1,10 +1,10 @@
-use crate::wire::DefIndex;
 use crate::DefStruct;
 use crate::def::{
     enums::ObjectAugmentationType,
     values::ObjectAugmentationParticleSet,
     wire::{DefString, VecMap},
 };
+use crate::wire::DefIndex;
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]
 pub struct ObjectAugmentationsDef {

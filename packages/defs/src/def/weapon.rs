@@ -1,17 +1,10 @@
 use crate::DefStruct;
 use crate::def::{
-    enums::DamageAttribute,
-    enums::IdleStateGroup,
-    enums::ObjectAugmentationType,
-    enums::WeaponClass,
-    enums::WeaponType,
-    values::FloatRange,
-    values::ObjectAugmentationParticleSet,
-    values::WeaponTrailGraphicSet,
-    wire::DefIndex,
+    enums::DamageAttribute, enums::IdleStateGroup, enums::ObjectAugmentationType,
+    enums::WeaponClass, enums::WeaponType, values::FloatRange,
+    values::ObjectAugmentationParticleSet, values::WeaponTrailGraphicSet, wire::DefIndex,
     wire::VecMap,
 };
-
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]
 pub struct WeaponDef {

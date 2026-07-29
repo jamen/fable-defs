@@ -11,3 +11,5 @@ Positional Arguments:
   source            input directory containing .def, .tpl, and .h files
   output            output directory for .bin files
 ```
+
+This project is experimental, please report any issues you have.

@@ -1,8 +1,5 @@
 use crate::DefStruct;
-use crate::def::{
-    values::TextureReplacementEntry,
-};
-
+use crate::def::values::TextureReplacementEntry;
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]
 pub struct TextureReplacementDef {

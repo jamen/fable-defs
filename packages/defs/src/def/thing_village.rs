@@ -1,11 +1,7 @@
 use crate::DefStruct;
 use crate::def::{
-    values::EngineGraphic,
-    values::ThingComponentSet,
-    wire::DefIndex,
-    wire::DefString,
+    values::EngineGraphic, values::ThingComponentSet, wire::DefIndex, wire::DefString,
 };
-
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]
 pub struct ThingVillageDef {

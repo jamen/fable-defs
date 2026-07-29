@@ -1,4 +1,3 @@
-
 use crate::{DefStruct, WireStruct};
 
 /// One entry of `NGraphicAppearance::CReplaceableMeshes` — original PC release layout.

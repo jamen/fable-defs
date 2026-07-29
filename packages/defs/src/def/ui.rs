@@ -1,7 +1,9 @@
-use crate::bytes::UnexpectedEnd;
 use crate::DefStruct;
+use crate::bytes::UnexpectedEnd;
 use crate::def::UiStateDef;
-use crate::enums::{ActionType, EngineGraphicType, Sprite2dFlags, TableExpansion, TextAlignment, UiType};
+use crate::enums::{
+    ActionType, EngineGraphicType, Sprite2dFlags, TableExpansion, TextAlignment, UiType,
+};
 use crate::visit::{AsField, DefDefault, FieldRef};
 use crate::wire::{DefIndex, DefString, ParseWireError, TaggedWire, WStr, Wire};
 use std::collections::BTreeMap;
@@ -86,7 +88,6 @@ impl AsField for MeshRef {
         }
     }
 }
-
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]
 pub struct UiDef {
@@ -316,7 +317,6 @@ pub struct UiDef {
     pub sprite2_d_flag: Sprite2dFlags,
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,12 +344,18 @@ mod tests {
 
         // Round-trips preserve the variant: the wire is a plain i32, but re-parsing
         // under the same Type tag reconstructs Bank vs Def.
-        assert_eq!(round_trip_tagged(MeshRef::Bank(8033), 3), MeshRef::Bank(8033));
+        assert_eq!(
+            round_trip_tagged(MeshRef::Bank(8033), 3),
+            MeshRef::Bank(8033)
+        );
         assert_eq!(
             round_trip_tagged(MeshRef::Def(DefIndex(500)), 8),
             MeshRef::Def(DefIndex(500))
         );
         // Same bytes, different tag => different variant (proves it's tag-driven).
-        assert_eq!(round_trip_tagged(MeshRef::Bank(500), 8), MeshRef::Def(DefIndex(500)));
+        assert_eq!(
+            round_trip_tagged(MeshRef::Bank(500), 8),
+            MeshRef::Def(DefIndex(500))
+        );
     }
 }

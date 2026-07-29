@@ -2,8 +2,7 @@
 //!
 //! Assembles `game.bin` / `frontend.bin` / `script.bin` (+ the shared
 //! `names.bin`) with **our own** global-index allocation for the named and
-//! sub-def regions, resolving every reference through a [`ScratchEnv`] backed by
-//! that allocation. No retail binary is consulted.
+//! sub-def regions. No retail binary is consulted.
 //!
 //! The pipeline has three phases:
 //! 1. **[`parse_corpus`]** — parse every `.def`/`.tpl` file once, loading all
@@ -11,31 +10,28 @@
 //!    shared [`ParsedCorpus`].
 //! 2. **[`build_one_bin`]** — for each binary, filter the corpus by manifest
 //!    membership, allocate indices, lower, and serialize. Driven by a
-//!    [`BinaryConfig`].
+//!    [`BinConfig`].
 //! 3. **Finalize** — write `names.bin` from the shared [`NamesBuilder`].
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use codespan_reporting::files::{Files, SimpleFiles};
-use codespan_reporting::term::{self, termcolor::StandardStream, Styles, StylesWriter};
+use codespan_reporting::term::{self, Styles, StylesWriter, termcolor::StandardStream};
+use def_compiler::{LowerError, flatten_specialization, lower_def, walk_def_files};
 use defs::crc32;
 use defs::def::binary::{
     Chunk, ChunkIndex, ChunkIndexEntry, ChunkIndexHeader, DefBinary, DefBinaryHeader, DefBody,
     EntryPreamble, EntryRecord, NameRef, SubDefRecord, def_name_has_subdef_table,
 };
-use defs::names::{Names, NamesEntry};
 use defs::def::text::{
-    DefFile, DefParseError, Definition, Expr, Span, Spanned, Statement, SymbolTable, TextParseErrorKind,
-    header::parse_header_file, parse_def_file,
+    DefFile, DefParseError, Definition, Expr, Span, Spanned, Statement, SymbolTable,
+    TextParseErrorKind, header::parse_header_file, parse_def_file,
 };
-use def_compiler::{
-    LowerEnv, LowerError, flatten_specialization, lower_def, walk_def_files,
-};
-
+use defs::names::NamesBuilder;
 
 fn emit_diagnostic(files: &SimpleFiles<String, String>, diag: &Diagnostic<usize>) {
     let writer = StandardStream::stderr(termcolor::ColorChoice::Auto);
@@ -103,10 +99,10 @@ fn collect_body_references(
         for stmt in &def.body {
             walk_stmt(&stmt.value, out);
         }
-        if let Some(parent_name) = &def.specializes {
-            if let Some(parent) = defs_by_name.get(parent_name.as_str()) {
-                walk_specialization_chain(parent, defs_by_name, out, visited);
-            }
+        if let Some(parent_name) = &def.specializes
+            && let Some(parent) = defs_by_name.get(parent_name.as_str())
+        {
+            walk_specialization_chain(parent, defs_by_name, out, visited);
         }
     }
     let mut refs = HashSet::new();
@@ -119,88 +115,18 @@ fn collect_body_references(
     refs
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Pipeline types
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Interns strings into the shared `names.bin` table, assigning each a stable
-/// offset. All three binaries share one instance (names.bin is a single table).
-struct NamesBuilder {
-    map: BTreeMap<u32, NamesEntry>,
-    off_of: HashMap<String, u32>,
-    pos: usize,
+/// Shared context built once per binary and threaded through the lowering
+/// and emission pipeline.
+struct BuildCtx<'a> {
+    symbols: &'a SymbolTable,
+    def_indices: &'a HashMap<String, u32>,
+    names: &'a RefCell<NamesBuilder>,
+    code_files: &'a SimpleFiles<String, String>,
+    def_to_file_id: &'a HashMap<String, usize>,
+    def_spans: &'a HashMap<String, Span>,
+    defs_by_name: &'a HashMap<&'a str, &'a Definition>,
+    nulldefs: &'a HashMap<String, DefBody>,
 }
-
-impl NamesBuilder {
-    fn new() -> Self {
-        Self {
-            map: BTreeMap::new(),
-            off_of: HashMap::new(),
-            pos: 20,
-        }
-    }
-
-    fn intern(&mut self, s: &str) -> u32 {
-        if let Some(&o) = self.off_of.get(s) {
-            return o;
-        }
-        let off = (self.pos + 4 - 20) as u32;
-        self.map.insert(
-            off,
-            NamesEntry {
-                crc: crc32::crc(s.as_bytes()),
-                string: s.to_string(),
-            },
-        );
-        self.off_of.insert(s.to_string(), off);
-        self.pos += 4 + s.len() + 1;
-        off
-    }
-
-    /// Consume the builder and produce a [`Names`] with pre-computed header
-    /// metadata (StringCount + StreamLength at offsets 8/12). The pre-existing
-    /// `NAMES_HEADER_BYTES` constant supplies the fixed magic + platform bytes.
-    fn finalize(self, header_bytes: [u8; 20]) -> Names {
-        let mut names = Names {
-            header_bytes,
-            map: self.map,
-        };
-        let bytes = names.to_bytes();
-        let string_count = names.map.len() as u32;
-        let stream_len = (bytes.len() - 16) as u32;
-        names.header_bytes[8..12].copy_from_slice(&string_count.to_le_bytes());
-        names.header_bytes[12..16].copy_from_slice(&stream_len.to_le_bytes());
-        names
-    }
-}
-
-/// Reference-resolution environment for lowering: named defs resolve to their
-/// (our-own) global index; def-strings intern into the shared name table.
-struct ScratchEnv<'n> {
-    def_indices: HashMap<String, u32>,
-    names: &'n RefCell<NamesBuilder>,
-}
-
-impl<'n> ScratchEnv<'n> {
-    fn new(def_indices: HashMap<String, u32>, names: &'n RefCell<NamesBuilder>) -> Self {
-        Self { def_indices, names }
-    }
-
-    fn intern(&self, s: &str) -> u32 {
-        self.names.borrow_mut().intern(s)
-    }
-}
-
-impl<'n> LowerEnv for ScratchEnv<'n> {
-    fn def_index(&self, name: &str) -> Option<u32> {
-        self.def_indices.get(name).copied()
-    }
-    fn def_string_offset(&self, string: &str) -> Option<u32> {
-        Some(self.intern(string))
-    }
-}
-
-/// Everything parsed from the text corpus — shared across all three binaries.
 struct ParsedCorpus {
     /// Parsed def files with their disk paths (for per-binary scoping).
     files: Vec<ParsedFile>,
@@ -228,19 +154,6 @@ struct BinConfig {
     /// (frontend/script) where the engine may reference templates by name.
     filter_templates: bool,
     file_scope: fn(corpus: &[ParsedFile]) -> Vec<&ParsedFile>,
-}
-
-/// Shared context built once per binary and threaded through the lowering
-/// and emission pipeline. Bundles the pass-through references so function
-/// signatures stay compact.
-struct BuildCtx<'a> {
-    symbols: &'a SymbolTable,
-    env: &'a ScratchEnv<'a>,
-    code_files: &'a SimpleFiles<String, String>,
-    def_to_file_id: &'a HashMap<String, usize>,
-    def_spans: &'a HashMap<String, Span>,
-    defs_by_name: &'a HashMap<&'a str, &'a Definition>,
-    nulldefs: &'a HashMap<String, DefBody>,
 }
 
 struct Built {
@@ -310,40 +223,300 @@ const NAMES_HEADER_BYTES: [u8; 20] = [
     0x00, 0x00, 0x00, 0x00,
 ];
 
-const GAME_NULLDEF_ENTRIES: &[&str] = &["ARMOUR","ATTACK_PATTERN","BRAIN","BUILDING","CAICreatureWillPowerIndicatorDef","CAIScratchpadDef","CAMERA_MANAGER","CAMERA_MANAGER_SET","CAMERA_MODE","CARRY_SLOT","CAbilityDef","CActionUseDef","CActivateQuestDef","CAnimatingObjectDef","CAppearanceDef","CAppearanceModifierDef","CAreaOfEffectAttackDef","CAugmentationDef","CBalverineBattleDef","CBedDef","CBettingDef","CBoastingPodiumDef","CBonusItemDef","CBossDef","CBriarRoseDef","CBuyHouseDef","CBuyableHouseDef","CCameraCollisionDef","CCarriedReadableDef","CCarryableDef","CCarryingDef","CChestDef","CClockDef","CCoinGameObstacleDef","CCombatAbilityBlockCounterAttackDef","CCombatAbilityBlockHeavyWeaponAttackDef","CCombatAbilityBlockLightWeaponAttackDef","CCombatAbilityBlockProjectileWeaponAttackDef","CCombatAbilityBlockUnarmedAttackDef","CCombatAbilityFlourishCounterAttackDef","CCombatAbilityGetHitCounterAttackDef","CCombatAbilityStrafeDef","CCombatAbilityUseProjectileWeaponDef","CContainerRewardHeroDef","CContextSensitiveItemDef","CCoopSpiritDef","CCrateStackDef","CCreatureDef","CCreatureGeneratorDef","CCreatureModeDef","CCreatureNavigationDef","CCreatureStatsDef","CDecapitationDef","CDegradableDef","CDoorDef","CDragonActionHoverDef","CDragonActionNapalmDef","CDragonActionSwoopDef","CDrunkennessDef","CEnemyDef","CEntitySoundDef","CExperienceDef","CExplodingObjectDef","CExplosionDef","CExplosiveTrailDef","CExpressionSubDef","CFireballSpellLevelDef","CFireheartMinigameDef","CFishDef","CFishingDef","CFishingRodDef","CFlammableDef","CGiftDef","CGoldDef","CGuardDef","CGuildMasterDef","CHairCardDef","CHasNameDef","CHeroCentreDef","CHeroDef","CHeroExperienceDef","CHeroMarriageDef","CHeroMorphDef","CHeroPostcardGeneratorDef","CHeroSpecialMovementDef","CHeroSuitDef","CHeroTitleDef","CHighlightItemDef","CHitLocationsDef","CIdleSchedulerDef","CInterestingToVillagersDef","CInventoryItemDef","CJackDragonDef","CJackOfBladesBattleDef","CKickableDef","CKrakenDef","CKrakenTentacleDef","CLightDef","CLightningOrbDef","CLookDef","CMazeBattleDef","CMultiStaticMeshDef","CNymphDef","COMBAT_DIALOGUE_DEF","COMBAT_SEQUENCE","COMBAT_TYPE","CONFIG_OPTIONS_DEFAULTS_DEF","CONTROL_SCHEME","CObjectAugmentationsDef","COccupiableDef","COpinionOfHeroDef","COracleMinigameDef","COverheadDisplayDef","CParticleAttacherDef","CPerceivedThingDef","CPhysicsDef","CQuestCardDef","CREATURE","CREATURE_ABILITY","CREATURE_GENERATION_FAMILY","CReadableDef","CReplaceableMeshDef","CResurrectionItemDef","CRumbleDef","CScorpionKingBattleDef","CShipDef","CShopDef","CShopItemDef","CSkeletalMorphDef","CSmashableDef","CSmokeGeneratorDef","CSnowTrollDef","CSoundAtmospheresDef","CSpecialAbilitiesDrainLifeDataDef","CSpecialAbilitiesForcePushDataDef","CSpecialEffectsDef","CSpotLightDef","CStealthDef","CStockItemDef","CSummonDef","CSummonableCreatureDef","CSummonerDef","CTCVolumeContainmentTrackerDef","CTargetingDef","CTattooDef","CTavernDef","CTavernGameCardBaseDef","CTavernGameCoinBaseDef","CTavernGameCoinGolfDef","CTavernGameDef","CTavernGameShoveHaPennyDef","CTavernGameSpotTheAdditionDef","CTavernTableDef","CTeleporterDef","CTextureReplacementDef","CThingDrainLifeShotDef","CThingMultiArrowShotDef","CThunderBattleDef","CTimeAppearanceFadeDef","CTrapDef","CTrollBattleDef","CTrophyDef","CTurncoatDef","CVillageDef","CVillageMemberDef","CVillagePeopleDef","CWallMountEffectsDef","CWaspQueenBattleDef","CWeaponDef","CWhisperBattleDef","CWifeDef","CWillResponseDef","ENGINE","ENGINE_THEME","ENGINE_THEME_GROUP","ENGINE_VIDEO_OPTIONS","ENVIRONMENT","ENVIRONMENT_THEME_DAY","EXPRESSION","FACTION","GLOBAL","HERO_ABILITY","HERO_COMBAT","HERO_MELEE_COMBAT_ABILITY","HERO_STATS","HIT_LOCATION","HOLY_SITE","INVENTORY_CATEGORY","INVENTORY_ITEM","INVENTORY_TYPE","LIGHTNING","LOCAL_DETAIL_GENERATOR","MARKER","MATERIAL","MELEE_COMBAT_KNOCKDOWN_EFFECTS","MESSAGE_EVENT","NOISE","OBJECT","OBJECT_FAMILY","OPINION_DEED_EFFECTS","OPINION_DEED_MASK","OPINION_PERSONALITY","OPINION_REACTION_MANAGER","OPINION_REACTION_MASK","OPINION_SOURCE","PHYSICAL_SWITCH","PLAYER","PLAYER_GUI","PLAYER_INVENTORY","PLAYER_MOVEMENT","REGION","SHOT","SIM_BUILDING","SIM_VOICES","SKY","SOUND_SETUP","SOUND_THEME","SPECIAL_ABILITIES_ASSASSIN_RUSH_DEF","SPECIAL_ABILITIES_BATTLE_CHARGE_DEF","SPECIAL_ABILITIES_BERSERK_DEF","SPECIAL_ABILITIES_BULLET_TIME_DEF","SPECIAL_ABILITIES_BURNT_EFFECT_DEF","SPECIAL_ABILITIES_CREATURE_TINT_DEF","SPECIAL_ABILITIES_DIVINE_WRATH_DEF","SPECIAL_ABILITIES_DRAIN_LIFE_DEF","SPECIAL_ABILITIES_DRUNKENNESS_DEF","SPECIAL_ABILITIES_ELECTROCUTED_EFFECT_DEF","SPECIAL_ABILITIES_ENFLAME_DEF","SPECIAL_ABILITIES_FIREBALL_SPELL_DEF","SPECIAL_ABILITIES_FORCE_PUSH_DEF","SPECIAL_ABILITIES_GHOST_SWORD_DEF","SPECIAL_ABILITIES_HEAL_LIFE_DEF","SPECIAL_ABILITIES_LIGHTNING_SPELL_DEF","SPECIAL_ABILITIES_MULTI_ARROW_DEF","SPECIAL_ABILITIES_MULTI_STRIKE_DEF","SPECIAL_ABILITIES_PHYSICAL_SHIELD_DEF","SPECIAL_ABILITIES_SUMMON_SPELL_DEF","SPECIAL_ABILITIES_THUNDER_LIGHTNING_STORM_DEF","SPECIAL_ABILITIES_TURNCOAT_SPELL_DEF","SPECIAL_ABILITIES_UNHOLY_POWER_DEF","SWITCH","THING","THING_GROUP","UI","UI_ICONS_DEF","UI_LOCALE_GRAPHICS_DEF","UI_MISC_THINGS_DEF","VILLAGE","VILLAGER_INTERACTION"];
+const GAME_NULLDEF_ENTRIES: &[&str] = &[
+    "ARMOUR",
+    "ATTACK_PATTERN",
+    "BRAIN",
+    "BUILDING",
+    "CAICreatureWillPowerIndicatorDef",
+    "CAIScratchpadDef",
+    "CAMERA_MANAGER",
+    "CAMERA_MANAGER_SET",
+    "CAMERA_MODE",
+    "CARRY_SLOT",
+    "CAbilityDef",
+    "CActionUseDef",
+    "CActivateQuestDef",
+    "CAnimatingObjectDef",
+    "CAppearanceDef",
+    "CAppearanceModifierDef",
+    "CAreaOfEffectAttackDef",
+    "CAugmentationDef",
+    "CBalverineBattleDef",
+    "CBedDef",
+    "CBettingDef",
+    "CBoastingPodiumDef",
+    "CBonusItemDef",
+    "CBossDef",
+    "CBriarRoseDef",
+    "CBuyHouseDef",
+    "CBuyableHouseDef",
+    "CCameraCollisionDef",
+    "CCarriedReadableDef",
+    "CCarryableDef",
+    "CCarryingDef",
+    "CChestDef",
+    "CClockDef",
+    "CCoinGameObstacleDef",
+    "CCombatAbilityBlockCounterAttackDef",
+    "CCombatAbilityBlockHeavyWeaponAttackDef",
+    "CCombatAbilityBlockLightWeaponAttackDef",
+    "CCombatAbilityBlockProjectileWeaponAttackDef",
+    "CCombatAbilityBlockUnarmedAttackDef",
+    "CCombatAbilityFlourishCounterAttackDef",
+    "CCombatAbilityGetHitCounterAttackDef",
+    "CCombatAbilityStrafeDef",
+    "CCombatAbilityUseProjectileWeaponDef",
+    "CContainerRewardHeroDef",
+    "CContextSensitiveItemDef",
+    "CCoopSpiritDef",
+    "CCrateStackDef",
+    "CCreatureDef",
+    "CCreatureGeneratorDef",
+    "CCreatureModeDef",
+    "CCreatureNavigationDef",
+    "CCreatureStatsDef",
+    "CDecapitationDef",
+    "CDegradableDef",
+    "CDoorDef",
+    "CDragonActionHoverDef",
+    "CDragonActionNapalmDef",
+    "CDragonActionSwoopDef",
+    "CDrunkennessDef",
+    "CEnemyDef",
+    "CEntitySoundDef",
+    "CExperienceDef",
+    "CExplodingObjectDef",
+    "CExplosionDef",
+    "CExplosiveTrailDef",
+    "CExpressionSubDef",
+    "CFireballSpellLevelDef",
+    "CFireheartMinigameDef",
+    "CFishDef",
+    "CFishingDef",
+    "CFishingRodDef",
+    "CFlammableDef",
+    "CGiftDef",
+    "CGoldDef",
+    "CGuardDef",
+    "CGuildMasterDef",
+    "CHairCardDef",
+    "CHasNameDef",
+    "CHeroCentreDef",
+    "CHeroDef",
+    "CHeroExperienceDef",
+    "CHeroMarriageDef",
+    "CHeroMorphDef",
+    "CHeroPostcardGeneratorDef",
+    "CHeroSpecialMovementDef",
+    "CHeroSuitDef",
+    "CHeroTitleDef",
+    "CHighlightItemDef",
+    "CHitLocationsDef",
+    "CIdleSchedulerDef",
+    "CInterestingToVillagersDef",
+    "CInventoryItemDef",
+    "CJackDragonDef",
+    "CJackOfBladesBattleDef",
+    "CKickableDef",
+    "CKrakenDef",
+    "CKrakenTentacleDef",
+    "CLightDef",
+    "CLightningOrbDef",
+    "CLookDef",
+    "CMazeBattleDef",
+    "CMultiStaticMeshDef",
+    "CNymphDef",
+    "COMBAT_DIALOGUE_DEF",
+    "COMBAT_SEQUENCE",
+    "COMBAT_TYPE",
+    "CONFIG_OPTIONS_DEFAULTS_DEF",
+    "CONTROL_SCHEME",
+    "CObjectAugmentationsDef",
+    "COccupiableDef",
+    "COpinionOfHeroDef",
+    "COracleMinigameDef",
+    "COverheadDisplayDef",
+    "CParticleAttacherDef",
+    "CPerceivedThingDef",
+    "CPhysicsDef",
+    "CQuestCardDef",
+    "CREATURE",
+    "CREATURE_ABILITY",
+    "CREATURE_GENERATION_FAMILY",
+    "CReadableDef",
+    "CReplaceableMeshDef",
+    "CResurrectionItemDef",
+    "CRumbleDef",
+    "CScorpionKingBattleDef",
+    "CShipDef",
+    "CShopDef",
+    "CShopItemDef",
+    "CSkeletalMorphDef",
+    "CSmashableDef",
+    "CSmokeGeneratorDef",
+    "CSnowTrollDef",
+    "CSoundAtmospheresDef",
+    "CSpecialAbilitiesDrainLifeDataDef",
+    "CSpecialAbilitiesForcePushDataDef",
+    "CSpecialEffectsDef",
+    "CSpotLightDef",
+    "CStealthDef",
+    "CStockItemDef",
+    "CSummonDef",
+    "CSummonableCreatureDef",
+    "CSummonerDef",
+    "CTCVolumeContainmentTrackerDef",
+    "CTargetingDef",
+    "CTattooDef",
+    "CTavernDef",
+    "CTavernGameCardBaseDef",
+    "CTavernGameCoinBaseDef",
+    "CTavernGameCoinGolfDef",
+    "CTavernGameDef",
+    "CTavernGameShoveHaPennyDef",
+    "CTavernGameSpotTheAdditionDef",
+    "CTavernTableDef",
+    "CTeleporterDef",
+    "CTextureReplacementDef",
+    "CThingDrainLifeShotDef",
+    "CThingMultiArrowShotDef",
+    "CThunderBattleDef",
+    "CTimeAppearanceFadeDef",
+    "CTrapDef",
+    "CTrollBattleDef",
+    "CTrophyDef",
+    "CTurncoatDef",
+    "CVillageDef",
+    "CVillageMemberDef",
+    "CVillagePeopleDef",
+    "CWallMountEffectsDef",
+    "CWaspQueenBattleDef",
+    "CWeaponDef",
+    "CWhisperBattleDef",
+    "CWifeDef",
+    "CWillResponseDef",
+    "ENGINE",
+    "ENGINE_THEME",
+    "ENGINE_THEME_GROUP",
+    "ENGINE_VIDEO_OPTIONS",
+    "ENVIRONMENT",
+    "ENVIRONMENT_THEME_DAY",
+    "EXPRESSION",
+    "FACTION",
+    "GLOBAL",
+    "HERO_ABILITY",
+    "HERO_COMBAT",
+    "HERO_MELEE_COMBAT_ABILITY",
+    "HERO_STATS",
+    "HIT_LOCATION",
+    "HOLY_SITE",
+    "INVENTORY_CATEGORY",
+    "INVENTORY_ITEM",
+    "INVENTORY_TYPE",
+    "LIGHTNING",
+    "LOCAL_DETAIL_GENERATOR",
+    "MARKER",
+    "MATERIAL",
+    "MELEE_COMBAT_KNOCKDOWN_EFFECTS",
+    "MESSAGE_EVENT",
+    "NOISE",
+    "OBJECT",
+    "OBJECT_FAMILY",
+    "OPINION_DEED_EFFECTS",
+    "OPINION_DEED_MASK",
+    "OPINION_PERSONALITY",
+    "OPINION_REACTION_MANAGER",
+    "OPINION_REACTION_MASK",
+    "OPINION_SOURCE",
+    "PHYSICAL_SWITCH",
+    "PLAYER",
+    "PLAYER_GUI",
+    "PLAYER_INVENTORY",
+    "PLAYER_MOVEMENT",
+    "REGION",
+    "SHOT",
+    "SIM_BUILDING",
+    "SIM_VOICES",
+    "SKY",
+    "SOUND_SETUP",
+    "SOUND_THEME",
+    "SPECIAL_ABILITIES_ASSASSIN_RUSH_DEF",
+    "SPECIAL_ABILITIES_BATTLE_CHARGE_DEF",
+    "SPECIAL_ABILITIES_BERSERK_DEF",
+    "SPECIAL_ABILITIES_BULLET_TIME_DEF",
+    "SPECIAL_ABILITIES_BURNT_EFFECT_DEF",
+    "SPECIAL_ABILITIES_CREATURE_TINT_DEF",
+    "SPECIAL_ABILITIES_DIVINE_WRATH_DEF",
+    "SPECIAL_ABILITIES_DRAIN_LIFE_DEF",
+    "SPECIAL_ABILITIES_DRUNKENNESS_DEF",
+    "SPECIAL_ABILITIES_ELECTROCUTED_EFFECT_DEF",
+    "SPECIAL_ABILITIES_ENFLAME_DEF",
+    "SPECIAL_ABILITIES_FIREBALL_SPELL_DEF",
+    "SPECIAL_ABILITIES_FORCE_PUSH_DEF",
+    "SPECIAL_ABILITIES_GHOST_SWORD_DEF",
+    "SPECIAL_ABILITIES_HEAL_LIFE_DEF",
+    "SPECIAL_ABILITIES_LIGHTNING_SPELL_DEF",
+    "SPECIAL_ABILITIES_MULTI_ARROW_DEF",
+    "SPECIAL_ABILITIES_MULTI_STRIKE_DEF",
+    "SPECIAL_ABILITIES_PHYSICAL_SHIELD_DEF",
+    "SPECIAL_ABILITIES_SUMMON_SPELL_DEF",
+    "SPECIAL_ABILITIES_THUNDER_LIGHTNING_STORM_DEF",
+    "SPECIAL_ABILITIES_TURNCOAT_SPELL_DEF",
+    "SPECIAL_ABILITIES_UNHOLY_POWER_DEF",
+    "SWITCH",
+    "THING",
+    "THING_GROUP",
+    "UI",
+    "UI_ICONS_DEF",
+    "UI_LOCALE_GRAPHICS_DEF",
+    "UI_MISC_THINGS_DEF",
+    "VILLAGE",
+    "VILLAGER_INTERACTION",
+];
 
-const FRONTEND_NULLDEF_ENTRIES: &[&str] = &["CONFIG_OPTIONS_DEFAULTS_DEF","CONTROL_SCHEME","CONTROL_SCHEME","ENGINE","ENGINE_VIDEO_OPTIONS","FRONT_END","UI","UI_ICONS_DEF","UI_MISC_THINGS_DEF"];
+const FRONTEND_NULLDEF_ENTRIES: &[&str] = &[
+    "CONFIG_OPTIONS_DEFAULTS_DEF",
+    "CONTROL_SCHEME",
+    "CONTROL_SCHEME",
+    "ENGINE",
+    "ENGINE_VIDEO_OPTIONS",
+    "FRONT_END",
+    "UI",
+    "UI_ICONS_DEF",
+    "UI_MISC_THINGS_DEF",
+];
 
-const SCRIPT_NULLDEF_ENTRIES: &[&str] = &["CCutsceneDef","CRegionScriptDef","CScriptDef"];
+const SCRIPT_NULLDEF_ENTRIES: &[&str] = &["CCutsceneDef", "CRegionScriptDef", "CScriptDef"];
 
 static GAME_CONFIG: BinConfig = BinConfig {
-    label:            "game",
-    nulldef_entries:  GAME_NULLDEF_ENTRIES,
-    binary_header:    GAME_HEADER,
-    out_filename:     "game.bin",
-    has_subdefs:      true,
+    label: "game",
+    nulldef_entries: GAME_NULLDEF_ENTRIES,
+    binary_header: GAME_HEADER,
+    out_filename: "game.bin",
+    has_subdefs: true,
     filter_templates: false,
-    file_scope:       game_file_scope,
+    file_scope: game_file_scope,
 };
 
 static FRONTEND_CONFIG: BinConfig = BinConfig {
-    label:            "frontend",
-    nulldef_entries:  FRONTEND_NULLDEF_ENTRIES,
-    binary_header:    FRONTEND_HEADER,
-    out_filename:     "frontend.bin",
-    has_subdefs:      false,
+    label: "frontend",
+    nulldef_entries: FRONTEND_NULLDEF_ENTRIES,
+    binary_header: FRONTEND_HEADER,
+    out_filename: "frontend.bin",
+    has_subdefs: false,
     filter_templates: false,
-    file_scope:       frontend_file_scope,
+    file_scope: frontend_file_scope,
 };
 
 static SCRIPT_CONFIG: BinConfig = BinConfig {
-    label:            "script",
-    nulldef_entries:  SCRIPT_NULLDEF_ENTRIES,
-    binary_header:    SCRIPT_HEADER,
-    out_filename:     "script.bin",
-    has_subdefs:      false,
+    label: "script",
+    nulldef_entries: SCRIPT_NULLDEF_ENTRIES,
+    binary_header: SCRIPT_HEADER,
+    out_filename: "script.bin",
+    has_subdefs: false,
     filter_templates: false,
-    file_scope:       script_file_scope,
+    file_scope: script_file_scope,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -442,7 +615,10 @@ fn parse_corpus(source: &Path) -> Result<ParsedCorpus, String> {
                     def_to_file_id.insert(d.value.name.clone(), fid);
                     def_spans.insert(d.value.name.clone(), d.span);
                 }
-                parsed_files.push(ParsedFile { path: path_str, def_file: f });
+                parsed_files.push(ParsedFile {
+                    path: path_str,
+                    def_file: f,
+                });
                 eprintln!("    {} ({} definitions)", p.display(), def_count);
             }
             Err(e) => {
@@ -476,20 +652,14 @@ fn parse_corpus(source: &Path) -> Result<ParsedCorpus, String> {
 //  Shared helper functions
 // ═══════════════════════════════════════════════════════════════════════════════
 
-
-
 fn def_header_end(text: &str, start: usize) -> usize {
-    text[start..]
-        .find('\n')
-        .map_or(text.len(), |n| start + n)
+    text[start..].find('\n').map_or(text.len(), |n| start + n)
 }
 
-fn render_parse_error(
-    files: &SimpleFiles<String, String>,
-    file_id: usize,
-    error: &DefParseError,
-) {
-    let Ok(source) = files.source(file_id) else { return };
+fn render_parse_error(files: &SimpleFiles<String, String>, file_id: usize, error: &DefParseError) {
+    let Ok(source) = files.source(file_id) else {
+        return;
+    };
     let msg = format!("{error}");
     let mut labels = Vec::new();
     match (&error.inner, error.def_header_pos) {
@@ -501,14 +671,11 @@ fn render_parse_error(
             );
         }
         (_, def_header) => {
-            labels.push(
-                Label::primary(file_id, error.pos..error.pos).with_message(msg.clone()),
-            );
+            labels.push(Label::primary(file_id, error.pos..error.pos).with_message(msg.clone()));
             if let Some(def_pos) = def_header {
                 let def_end = def_header_end(source, def_pos);
                 labels.push(
-                    Label::secondary(file_id, def_pos..def_end)
-                        .with_message("in this definition"),
+                    Label::secondary(file_id, def_pos..def_end).with_message("in this definition"),
                 );
             }
         }
@@ -536,10 +703,7 @@ fn render_lowering_error(
     let expr_span = error.primary_span();
     let mut labels = Vec::new();
     if let Some(span) = expr_span {
-        labels.push(
-            Label::primary(fid, span.start..span.end)
-                .with_message(format!("{error}")),
-        );
+        labels.push(Label::primary(fid, span.start..span.end).with_message(format!("{error}")));
     }
     if let Some(dspan) = def_span {
         let header_end = def_header_end(text, dspan.start);
@@ -548,8 +712,7 @@ fn render_lowering_error(
             let name_start = dspan.start + name_pos;
             let name_end = name_start + def_name.len();
             labels.push(
-                Label::secondary(fid, name_start..name_end)
-                    .with_message("in this definition"),
+                Label::secondary(fid, name_start..name_end).with_message("in this definition"),
             );
         }
     }
@@ -598,14 +761,16 @@ fn collect_named(
 fn build_nulldefs(
     classes: &[&str],
     symbols: &SymbolTable,
-    env: &ScratchEnv,
+    def_indices: &HashMap<String, u32>,
+    names: &RefCell<NamesBuilder>,
 ) -> HashMap<String, DefBody> {
     let mut map: HashMap<String, DefBody> = HashMap::new();
     for &dn in classes {
         if map.contains_key(dn) {
             continue;
         }
-        let (body, _warnings) = lower_def(dn, None, &[], symbols, env).expect("NULLDEF lowering should never fail");
+        let (body, _warnings) = lower_def(dn, None, &[], symbols, def_indices, names)
+            .expect("NULLDEF lowering should never fail");
         map.insert(dn.to_string(), body);
     }
     map
@@ -620,15 +785,18 @@ fn emit_nulldef_and_named(
     let mut nulldef_counter: HashMap<String, u32> = HashMap::new();
     for &class_name in nulldef_entries {
         let fnm = format!("NULLDEF_{class_name}");
-        let body = ctx.nulldefs
+        let body = ctx
+            .nulldefs
             .get(class_name)
             .expect("NULLDEF body should be pre-built")
             .clone();
         let cc = nulldef_counter.entry(class_name.to_string()).or_insert(0);
         *cc += 1;
+        let def_name_off = ctx.names.borrow_mut().intern(class_name);
+        let file_name_off = ctx.names.borrow_mut().intern(&fnm);
         entries.push(Built {
-            def_name_off: ctx.env.intern(class_name),
-            file_name_off: ctx.env.intern(&fnm),
+            def_name_off,
+            file_name_off,
             counter: *cc,
             preamble: EntryPreamble {
                 is_real: false,
@@ -654,8 +822,8 @@ fn emit_nulldef_and_named(
             continue;
         };
         let def_type = def.def_type.clone();
-        let def_name_off = ctx.env.intern(&def_type);
-        let file_name_off = ctx.env.intern(name);
+        let def_name_off = ctx.names.borrow_mut().intern(&def_type);
+        let file_name_off = ctx.names.borrow_mut().intern(name);
 
         let body = match flatten_specialization(def, ctx.defs_by_name) {
             Ok(b) => b,
@@ -681,7 +849,8 @@ fn emit_nulldef_and_named(
             ctx.nulldefs.get(def_type.as_str()).as_ref().copied(),
             &body,
             ctx.symbols,
-            ctx.env,
+            ctx.def_indices,
+            ctx.names,
         ) {
             Ok(b) => {
                 n_ok += 1;
@@ -849,7 +1018,8 @@ fn build_subdefs<'a>(
                 ctx.nulldefs.get(tag.as_str()).as_ref().copied(),
                 blk,
                 ctx.symbols,
-                ctx.env,
+                ctx.def_indices,
+                ctx.names,
             ) {
                 Ok(b) => {
                     sub_ok += 1;
@@ -858,11 +1028,10 @@ fn build_subdefs<'a>(
                 Err(e) => {
                     if let Some(&fid) = ctx.def_to_file_id.get(name.as_str()) {
                         let diag = Diagnostic::error()
-                            .with_message(format!(
-                                "sub-def lowering failed for <{tag}> in {name}"
-                            ))
-                            .with_labels(vec![Label::secondary(fid, 0..0)
-                                .with_message(format!("{e}"))]);
+                            .with_message(format!("sub-def lowering failed for <{tag}> in {name}"))
+                            .with_labels(vec![
+                                Label::secondary(fid, 0..0).with_message(format!("{e}")),
+                            ]);
                         emit_diagnostic(ctx.code_files, &diag);
                     }
                     sub_fail += 1;
@@ -883,7 +1052,7 @@ fn build_subdefs<'a>(
                     let cc = sub_counter.entry(tag.clone()).or_insert(0);
                     *cc += 1;
                     sub_entries.push(Built {
-                        def_name_off: ctx.env.intern(tag),
+                        def_name_off: ctx.names.borrow_mut().intern(tag),
                         file_name_off: u32::MAX,
                         counter: *cc,
                         preamble: EntryPreamble {
@@ -950,13 +1119,23 @@ fn build_one_bin(
         None
     };
     let nulldef_count = config.nulldef_entries.len() as u32;
-    let (named_order, named_indices) = collect_named(&scoped, &allowed_def_types, body_refs.as_ref(), nulldef_count);
+    let (named_order, named_indices) = collect_named(
+        &scoped,
+        &allowed_def_types,
+        body_refs.as_ref(),
+        nulldef_count,
+    );
 
-    let env = ScratchEnv::new(named_indices, names);
-    let nulldefs = build_nulldefs(config.nulldef_entries, &corpus.symbols, &env);
+    let nulldefs = build_nulldefs(
+        config.nulldef_entries,
+        &corpus.symbols,
+        &named_indices,
+        names,
+    );
     let ctx = BuildCtx {
         symbols: &corpus.symbols,
-        env: &env,
+        def_indices: &named_indices,
+        names,
         code_files: &corpus.code_files,
         def_to_file_id: &corpus.def_to_file_id,
         def_spans: &corpus.def_spans,
@@ -966,21 +1145,11 @@ fn build_one_bin(
 
     eprintln!("    lowering {} named definitions...", named_order.len());
     let mut entries: Vec<Built> = Vec::new();
-    let n_ok = emit_nulldef_and_named(
-        &mut entries,
-        config.nulldef_entries,
-        &named_order,
-        &ctx,
-    )?;
+    let n_ok = emit_nulldef_and_named(&mut entries, config.nulldef_entries, &named_order, &ctx)?;
 
     let named_base = nulldef_count as usize;
     let (sub_ok, sub_fail, unique_subdefs) = if config.has_subdefs {
-        build_subdefs(
-            &named_order,
-            named_base,
-            &ctx,
-            &mut entries,
-        )?
+        build_subdefs(&named_order, named_base, &ctx, &mut entries)?
     } else {
         (0, 0, 0)
     };
@@ -1015,9 +1184,9 @@ pub fn build_all(source: &Path, out_dir: &Path) -> Result<(), String> {
 
     eprintln!("  compiling...");
     let builder_cell = RefCell::new(NamesBuilder::new());
-    let game_count      = build_one_bin(&corpus, &GAME_CONFIG,      &builder_cell, out_dir)?;
-    let frontend_count  = build_one_bin(&corpus, &FRONTEND_CONFIG,  &builder_cell, out_dir)?;
-    let script_count    = build_one_bin(&corpus, &SCRIPT_CONFIG,    &builder_cell, out_dir)?;
+    let game_count = build_one_bin(&corpus, &GAME_CONFIG, &builder_cell, out_dir)?;
+    let frontend_count = build_one_bin(&corpus, &FRONTEND_CONFIG, &builder_cell, out_dir)?;
+    let script_count = build_one_bin(&corpus, &SCRIPT_CONFIG, &builder_cell, out_dir)?;
 
     let names = builder_cell.into_inner().finalize(NAMES_HEADER_BYTES);
     let names_bytes = names.to_bytes();

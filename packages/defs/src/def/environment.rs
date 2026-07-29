@@ -128,4 +128,3 @@ pub struct EnvironmentDef {
     #[def("WaterLakeMaximumFlowSpeed")]
     pub water_lake_maximum_flow_speed: f32,
 }
-

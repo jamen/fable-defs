@@ -38,4 +38,3 @@ pub struct EngineDef {
     #[def("InvalidThemeStandin")]
     pub invalid_theme_standin: DefIndex,
 }
-

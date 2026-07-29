@@ -4,7 +4,7 @@ pub mod lexer;
 pub mod symbols;
 
 pub use self::base::{LineIndex, Span, Spanned};
-pub use self::lexer::{LexError, LexErrorKind, Lexer, Token, TokenKind, lex, TextParseErrorKind};
+pub use self::lexer::{LexError, LexErrorKind, Lexer, TextParseErrorKind, Token, TokenKind, lex};
 pub use self::symbols::SymbolTable;
 
 use self::base::ParseError;
@@ -244,9 +244,12 @@ fn parse_file(cursor: &mut Cursor<'_>) -> Result<DefFile, ParseError<TextParseEr
                 file.headers
                     .push(header::parse_item_on_cursor(cursor).map_err(|e| {
                         let pos = e.pos;
-                        ParseError::new(pos, TextParseErrorKind::UnexpectedToken {
-                            expected: format!("enum or #define declaration: {}", e.inner),
-                        })
+                        ParseError::new(
+                            pos,
+                            TextParseErrorKind::UnexpectedToken {
+                                expected: format!("enum or #define declaration: {}", e.inner),
+                            },
+                        )
                     })?);
             }
             // Stray tokens between top-level items are skipped, as the
@@ -318,9 +321,7 @@ fn parse_definition(
                 .with_def_header(def_start);
             return Err(err);
         }
-        body.push(
-            parse_statement(cursor).map_err(|e| e.with_def_header(def_start))?,
-        );
+        body.push(parse_statement(cursor).map_err(|e| e.with_def_header(def_start))?);
     };
 
     let (specializes, specializes_span) = match specializes {
@@ -602,8 +603,8 @@ fn parse_arguments(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::lexer::TextParseErrorKind;
+    use super::*;
 
     fn parse_def(body: &str) -> Spanned<Definition> {
         let input = format!("#definition OBJECT T\n{body}\n#end_definition");
@@ -932,7 +933,9 @@ mod tests {
         else {
             panic!()
         };
-        let Expr::String(s) = &f.expr.value else { panic!() };
+        let Expr::String(s) = &f.expr.value else {
+            panic!()
+        };
         assert_eq!(s, "Test");
     }
 
@@ -993,7 +996,10 @@ mod tests {
             "#end_definition\n",
         );
         let err = parse_def_file(input).unwrap_err();
-        assert!(matches!(err.inner, TextParseErrorKind::MissingEndDefinition));
+        assert!(matches!(
+            err.inner,
+            TextParseErrorKind::MissingEndDefinition
+        ));
         // The error is anchored at the second `#definition` (the token that
         // revealed FIRST was never closed), not swallowed away.
         assert_eq!(err.pos, input.find("#definition OBJECT SECOND").unwrap());

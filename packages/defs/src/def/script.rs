@@ -1,13 +1,7 @@
 use crate::DefStruct;
 use crate::def::{
-    ArenaRoundDef,
-    Conversation,
-    FeatDef,
-    FireHeartPatternDef,
-    HeroSoulsRoundDef,
-    wire::DefString,
+    ArenaRoundDef, Conversation, FeatDef, FireHeartPatternDef, HeroSoulsRoundDef, wire::DefString,
 };
-
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]
 pub struct ScriptDef {

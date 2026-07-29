@@ -1,12 +1,6 @@
 use crate::DefStruct;
+use crate::def::{enums::TrapTriggerType, enums::TrapType, wire::DefString, wire::VecMap};
 use crate::wire::DefIndex;
-use crate::def::{
-    enums::TrapTriggerType,
-    enums::TrapType,
-    wire::DefString,
-    wire::VecMap,
-};
-
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]
 pub struct TrapDef {

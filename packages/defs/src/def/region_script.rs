@@ -1,6 +1,5 @@
 use crate::DefStruct;
 
-
 #[derive(Debug, Clone, PartialEq, DefStruct)]
 pub struct RegionScriptDef {
     #[def("RandomVillagerMax")]

@@ -29,16 +29,16 @@
 
 use std::collections::BTreeMap;
 
+use crate::binary::{
+    ID_BYTE_SIZE, ParseControlError, ParseControlErrorReason, SerializeControlError,
+    SerializeControlErrorReason,
+};
 use crate::bytes::{
     TakeError, TakeNullTerminatedUtf8, TakeNullTerminatedUtf16, UnexpectedEnd, put, put_le,
     put_null_terminated_utf8, put_null_terminated_utf16, take, take_le, take_null_terminated_utf8,
     take_null_terminated_utf16,
 };
 use crate::crc32::crc;
-use crate::binary::{
-    ID_BYTE_SIZE, ParseControlError, ParseControlErrorReason, SerializeControlError,
-    SerializeControlErrorReason,
-};
 
 // ── Wire ──────────────────────────────────────────────────────────────────────
 
@@ -489,7 +489,10 @@ pub fn parse_field_tagged<T: TaggedWire>(
     if id != expected {
         return Err(ParseControlError {
             name,
-            reason: ParseControlErrorReason::WrongId { expected, found: id },
+            reason: ParseControlErrorReason::WrongId {
+                expected,
+                found: id,
+            },
         });
     }
     T::parse_tagged(cur, tag).map_err(|inner| ParseControlError {
@@ -660,7 +663,10 @@ mod tests {
         round_trip(TestEnumSmoke::B);
 
         assert_eq!(TestEnumSmoke::A.symbol(), "VALUE_A");
-        assert_eq!(TestEnumSmoke::from_symbol("VALUE_B"), Some(TestEnumSmoke::B));
+        assert_eq!(
+            TestEnumSmoke::from_symbol("VALUE_B"),
+            Some(TestEnumSmoke::B)
+        );
         assert_eq!(TestEnumSmoke::from_symbol("MISSING"), None);
     }
 

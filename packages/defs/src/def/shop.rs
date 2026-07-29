@@ -1,11 +1,5 @@
 use crate::DefStruct;
-use crate::def::{
-    ShopItemDef,
-    enums::Opinion,
-    wire::DefIndex,
-    wire::VecMap,
-};
-
+use crate::def::{ShopItemDef, enums::Opinion, wire::DefIndex, wire::VecMap};
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]
 pub struct ShopDef {

@@ -11,4 +11,3 @@ pub struct FrontEndDef {
     #[def("ButtonBBigGraphic")]
     pub button_b_big_graphic: i32,
 }
-

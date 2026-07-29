@@ -16,8 +16,8 @@
 //!   probe_field $OUT game Font --vs $REF
 //!   probe_field $REF game PersistenceFlags
 use defs::def::binary::DefBinary;
-use defs::names::Names;
 use defs::def::visit::{FieldRef, FieldVisitor, VisitFields};
+use defs::names::Names;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -43,10 +43,10 @@ fn index_names(dir: &str, bin: &str) -> BTreeMap<i32, String> {
     let (b, names) = load(dir, bin);
     let mut m = BTreeMap::new();
     for e in b.entries(&names) {
-        if let Some(f) = e.file_name {
-            if !f.starts_with("NULLDEF_") {
-                m.insert(e.global_index as i32, f.to_string());
-            }
+        if let Some(f) = e.file_name
+            && !f.starts_with("NULLDEF_")
+        {
+            m.insert(e.global_index as i32, f.to_string());
         }
     }
     m
@@ -120,7 +120,12 @@ fn collect(dir: &str, bin: &str, field: &str) -> BTreeMap<String, String> {
             _ => continue,
         };
         let mut body = e.record.body.clone();
-        let mut g = Grab { want: field, got: None, names: &names, idx2name: &idx2name };
+        let mut g = Grab {
+            want: field,
+            got: None,
+            names: &names,
+            idx2name: &idx2name,
+        };
         body.visit_fields(&mut g);
         if let Some(v) = g.got {
             out.insert(key, v);
@@ -137,7 +142,10 @@ struct DumpAll<'n> {
 }
 impl FieldVisitor for DumpAll<'_> {
     fn field(&mut self, name: &'static str, field: FieldRef<'_>) {
-        self.fields.push((name.to_string(), render_deep(&field, self.names, self.idx2name)));
+        self.fields.push((
+            name.to_string(),
+            render_deep(&field, self.names, self.idx2name),
+        ));
     }
 }
 
@@ -149,7 +157,11 @@ fn entry_diff(dir: &str, retail: &str, bin: &str, entry: &str) {
         for e in b.entries(&names) {
             if e.file_name == Some(entry) || e.def_name == Some(entry) {
                 let mut body = e.record.body.clone();
-                let mut v = DumpAll { fields: vec![], names: &names, idx2name: &idx2name };
+                let mut v = DumpAll {
+                    fields: vec![],
+                    names: &names,
+                    idx2name: &idx2name,
+                };
                 body.visit_fields(&mut v);
                 return v.fields;
             }
@@ -160,14 +172,18 @@ fn entry_diff(dir: &str, retail: &str, bin: &str, entry: &str) {
     let theirs = dump(retail);
     let tmap: BTreeMap<_, _> = theirs.iter().cloned().collect();
     println!("== {entry} field diff (ours vs retail); showing only divergences ==");
-    let meaning = |s: &str| s.split_once(" -> ").map(|(_, m)| m.to_string()).unwrap_or_else(|| s.to_string());
+    let meaning = |s: &str| {
+        s.split_once(" -> ")
+            .map(|(_, m)| m.to_string())
+            .unwrap_or_else(|| s.to_string())
+    };
     let mut n = 0;
     for (name, ov) in &ours {
-        if let Some(tv) = tmap.get(name) {
-            if meaning(ov) != meaning(tv) {
-                println!("  {name:<28} ours={ov:<22} theirs={tv}");
-                n += 1;
-            }
+        if let Some(tv) = tmap.get(name)
+            && meaning(ov) != meaning(tv)
+        {
+            println!("  {name:<28} ours={ov:<22} theirs={tv}");
+            n += 1;
         }
     }
     println!("{n} field(s) diverge");
@@ -176,7 +192,9 @@ fn entry_diff(dir: &str, retail: &str, bin: &str, entry: &str) {
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     if a.len() < 4 {
-        eprintln!("usage: probe_field <dir> <game|frontend|script> <FieldName|--entry NAME> [--vs <retail_dir>]");
+        eprintln!(
+            "usage: probe_field <dir> <game|frontend|script> <FieldName|--entry NAME> [--vs <retail_dir>]"
+        );
         std::process::exit(2);
     }
     let (dir, bin) = (&a[1], &a[2]);
@@ -188,7 +206,10 @@ fn main() {
     let field = &a[3];
 
     let ours = collect(dir, bin, field);
-    println!("== {field} in {bin}.bin ({dir}) — {} entries carry it ==", ours.len());
+    println!(
+        "== {field} in {bin}.bin ({dir}) — {} entries carry it ==",
+        ours.len()
+    );
 
     let mut hist: BTreeMap<&str, usize> = BTreeMap::new();
     for v in ours.values() {
@@ -213,16 +234,18 @@ fn main() {
         // For DefString fields the raw offset differs by names.bin layout; the
         // meaning is the part after "-> ". Compare that when present.
         let meaning = |s: &str| -> String {
-            s.split_once(" -> ").map(|(_, m)| m.to_string()).unwrap_or_else(|| s.to_string())
+            s.split_once(" -> ")
+                .map(|(_, m)| m.to_string())
+                .unwrap_or_else(|| s.to_string())
         };
         for (k, ov) in &ours {
-            if let Some(tv) = theirs.get(k) {
-                if meaning(ov) != meaning(tv) {
-                    diffs += 1;
-                    if shown < 40 {
-                        println!("  {k:<40} ours={ov:<24} theirs={tv}");
-                        shown += 1;
-                    }
+            if let Some(tv) = theirs.get(k)
+                && meaning(ov) != meaning(tv)
+            {
+                diffs += 1;
+                if shown < 40 {
+                    println!("  {k:<40} ours={ov:<24} theirs={tv}");
+                    shown += 1;
                 }
             }
         }

@@ -1,17 +1,9 @@
 use crate::DefStruct;
 use crate::def::{
-    enums::ControlledMovementType,
-    enums::CreatureInteractionType,
-    enums::CreatureType,
-    enums::NavigatorType,
-    enums::Sex,
-    enums::ThingCreatureProperty,
-    values::EngineGraphic,
-    values::ThingComponentSet,
-    wire::DefIndex,
-    wire::DefString,
+    enums::ControlledMovementType, enums::CreatureInteractionType, enums::CreatureType,
+    enums::NavigatorType, enums::Sex, enums::ThingCreatureProperty, values::EngineGraphic,
+    values::ThingComponentSet, wire::DefIndex, wire::DefString,
 };
-
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]
 pub struct ThingCreatureDef {

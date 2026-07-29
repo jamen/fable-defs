@@ -1,9 +1,5 @@
 use crate::DefStruct;
-use crate::def::{
-    enums::OpinionDeedType,
-    values::OpinionPersonalityTraitsPtr,
-    wire::VecMap,
-};
+use crate::def::{enums::OpinionDeedType, values::OpinionPersonalityTraitsPtr, wire::VecMap};
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]
 pub struct OpinionPersonalityDef {

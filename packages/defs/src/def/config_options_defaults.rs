@@ -31,4 +31,3 @@ pub struct ConfigOptionsDefaultsDef {
     #[def("MinResolutionHeight", default = 768)]
     pub min_resolution_height: i32,
 }
-

@@ -144,9 +144,7 @@ fn parse_enum_expr(cursor: &mut Cursor<'_>) -> Result<EnumExpr, ParseError<TextP
     parse_enum_bitor(cursor)
 }
 
-fn parse_enum_bitor(
-    cursor: &mut Cursor<'_>,
-) -> Result<EnumExpr, ParseError<TextParseErrorKind>> {
+fn parse_enum_bitor(cursor: &mut Cursor<'_>) -> Result<EnumExpr, ParseError<TextParseErrorKind>> {
     let first = parse_enum_shift(cursor)?;
     let mut terms = vec![first];
     while cursor.at(super::lexer::TokenKind::Pipe) {
@@ -160,9 +158,7 @@ fn parse_enum_bitor(
     })
 }
 
-fn parse_enum_shift(
-    cursor: &mut Cursor<'_>,
-) -> Result<EnumExpr, ParseError<TextParseErrorKind>> {
+fn parse_enum_shift(cursor: &mut Cursor<'_>) -> Result<EnumExpr, ParseError<TextParseErrorKind>> {
     let first = parse_enum_leaf(cursor)?;
     let mut terms = vec![first];
     while cursor.at(super::lexer::TokenKind::Shl) {
@@ -200,9 +196,7 @@ fn parse_enum_leaf(cursor: &mut Cursor<'_>) -> Result<EnumExpr, ParseError<TextP
     }
 }
 
-fn parse_define_body(
-    cursor: &mut Cursor<'_>,
-) -> Result<Define, ParseError<TextParseErrorKind>> {
+fn parse_define_body(cursor: &mut Cursor<'_>) -> Result<Define, ParseError<TextParseErrorKind>> {
     let name = cursor.expect_ident("identifier")?;
     let t = cursor.peek();
     if t.kind != super::lexer::TokenKind::Number {
@@ -302,9 +296,7 @@ impl<'a> HeaderParser<'a> {
         skip_prologue(&mut self.cursor);
         loop {
             let tk = self.cursor.peek().kind;
-            if tk == super::lexer::TokenKind::Eof
-                || tk == super::lexer::TokenKind::Endif
-            {
+            if tk == super::lexer::TokenKind::Eof || tk == super::lexer::TokenKind::Endif {
                 break;
             }
             header.items.push(parse_item_on_cursor(&mut self.cursor)?);
@@ -356,8 +348,8 @@ pub fn parse_header_file(input: &str) -> Result<Header, HeaderParseError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::lexer::TextParseErrorKind;
+    use super::*;
 
     fn parse_h(input: &str) -> Header {
         parse_header_file(input).expect("header parse ok")
@@ -383,7 +375,9 @@ mod tests {
     fn named_enum() {
         let h = parse_h("enum EFoo { A = 1, B = 2 };");
         assert_eq!(h.items.len(), 1);
-        let HeaderItem::Enum(decl) = &h.items[0] else { panic!() };
+        let HeaderItem::Enum(decl) = &h.items[0] else {
+            panic!()
+        };
         assert_eq!(decl.name.as_deref(), Some("EFoo"));
         assert_eq!(decl.variants.len(), 2);
         assert_eq!(decl.variants[0].name, "A");
@@ -395,7 +389,9 @@ mod tests {
     #[test]
     fn anonymous_enum() {
         let h = parse_h("enum { A = 1, B = 2 };");
-        let HeaderItem::Enum(decl) = &h.items[0] else { panic!() };
+        let HeaderItem::Enum(decl) = &h.items[0] else {
+            panic!()
+        };
         assert!(decl.name.is_none());
         assert_eq!(decl.variants.len(), 2);
     }
@@ -403,7 +399,9 @@ mod tests {
     #[test]
     fn auto_increment() {
         let h = parse_h("enum EFoo { A = 1, B, C = 5, D };");
-        let HeaderItem::Enum(decl) = &h.items[0] else { panic!() };
+        let HeaderItem::Enum(decl) = &h.items[0] else {
+            panic!()
+        };
         assert!(matches!(decl.variants[0].value, Some(EnumExpr::Int(1))));
         assert!(decl.variants[1].value.is_none()); // B = 2 (auto)
         assert!(matches!(decl.variants[2].value, Some(EnumExpr::Int(5))));
@@ -413,7 +411,9 @@ mod tests {
     #[test]
     fn enum_with_ident_value() {
         let h = parse_h("enum EFoo { A = NO_SOUND_TYPES };");
-        let HeaderItem::Enum(decl) = &h.items[0] else { panic!() };
+        let HeaderItem::Enum(decl) = &h.items[0] else {
+            panic!()
+        };
         assert!(matches!(
             &decl.variants[0].value,
             Some(EnumExpr::Ident(s)) if s == "NO_SOUND_TYPES"
@@ -423,21 +423,31 @@ mod tests {
     #[test]
     fn enum_with_bitor_expression() {
         let h = parse_h("enum EFoo { A = 1 | 2 | 4 };");
-        let HeaderItem::Enum(decl) = &h.items[0] else { panic!() };
-        assert!(matches!(&decl.variants[0].value, Some(EnumExpr::BitOr(terms)) if terms.len() == 3));
+        let HeaderItem::Enum(decl) = &h.items[0] else {
+            panic!()
+        };
+        assert!(
+            matches!(&decl.variants[0].value, Some(EnumExpr::BitOr(terms)) if terms.len() == 3)
+        );
     }
 
     #[test]
     fn enum_with_shift_expression() {
         let h = parse_h("enum EFoo { A = 1 << 0, B = 1 << 1 };");
-        let HeaderItem::Enum(decl) = &h.items[0] else { panic!() };
-        assert!(matches!(&decl.variants[0].value, Some(EnumExpr::Shift(terms)) if terms.len() == 2));
+        let HeaderItem::Enum(decl) = &h.items[0] else {
+            panic!()
+        };
+        assert!(
+            matches!(&decl.variants[0].value, Some(EnumExpr::Shift(terms)) if terms.len() == 2)
+        );
     }
 
     #[test]
     fn enum_trailing_comma() {
         let h = parse_h("enum EFoo { A = 1, B = 2, };");
-        let HeaderItem::Enum(decl) = &h.items[0] else { panic!() };
+        let HeaderItem::Enum(decl) = &h.items[0] else {
+            panic!()
+        };
         assert_eq!(decl.variants.len(), 2);
     }
 
@@ -450,7 +460,9 @@ mod tests {
     #[test]
     fn define_positive() {
         let h = parse_h("#define FOO 42");
-        let HeaderItem::Define(d) = &h.items[0] else { panic!() };
+        let HeaderItem::Define(d) = &h.items[0] else {
+            panic!()
+        };
         assert_eq!(d.name, "FOO");
         assert_eq!(d.value, 42);
     }
@@ -458,14 +470,18 @@ mod tests {
     #[test]
     fn define_negative() {
         let h = parse_h("#define FOO -42");
-        let HeaderItem::Define(d) = &h.items[0] else { panic!() };
+        let HeaderItem::Define(d) = &h.items[0] else {
+            panic!()
+        };
         assert_eq!(d.value, -42);
     }
 
     #[test]
     fn namespace_with_enums() {
         let h = parse_h("namespace NFoo { enum EA { X = 1 }; }");
-        let HeaderItem::Namespace(ns) = &h.items[0] else { panic!() };
+        let HeaderItem::Namespace(ns) = &h.items[0] else {
+            panic!()
+        };
         assert_eq!(ns.name, "NFoo");
         assert_eq!(ns.items.len(), 1);
     }
@@ -473,7 +489,9 @@ mod tests {
     #[test]
     fn ifdef_with_else() {
         let h = parse_h("#ifdef _WINDOWS\n#define FOO 1\n#else\n#define FOO 2\n#endif");
-        let HeaderItem::IfDef(ifdef) = &h.items[0] else { panic!() };
+        let HeaderItem::IfDef(ifdef) = &h.items[0] else {
+            panic!()
+        };
         assert_eq!(ifdef.condition, "_WINDOWS");
         assert_eq!(ifdef.if_branch.len(), 1);
         assert_eq!(ifdef.else_branch.as_ref().unwrap().len(), 1);
@@ -484,9 +502,13 @@ mod tests {
     fn ifndef_as_item() {
         // Put `#ifndef` after a namespace so it's not consumed by the prologue.
         let h = parse_h("namespace N { #ifndef _WINDOWS\n#define FOO 1\n#endif }");
-        let HeaderItem::Namespace(ns) = &h.items[0] else { panic!() };
+        let HeaderItem::Namespace(ns) = &h.items[0] else {
+            panic!()
+        };
         assert_eq!(ns.items.len(), 1);
-        let HeaderItem::IfDef(ifdef) = &ns.items[0] else { panic!() };
+        let HeaderItem::IfDef(ifdef) = &ns.items[0] else {
+            panic!()
+        };
         assert!(ifdef.inverted);
         assert_eq!(ifdef.if_branch.len(), 1);
     }

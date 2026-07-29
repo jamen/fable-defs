@@ -1,7 +1,7 @@
 use crate::{
-    wire::ParseWireError,
     bytes::{TakeError, UnexpectedEnd, put, put_bytes, take, take_bytes},
-    names::{Names, NamesEntry}
+    names::{Names, NamesEntry},
+    wire::ParseWireError,
 };
 use std::{
     fs::File,
@@ -27,23 +27,41 @@ pub enum BinParseError {
     Decompress(miniz_oxide::inflate::DecompressError),
     /// A named field in a binary container struct (header, name-ref, chunk
     /// index entry, entry record, etc.).
-    Field { name: &'static str, inner: Box<BinParseError> },
+    Field {
+        name: &'static str,
+        inner: Box<BinParseError>,
+    },
     /// An indexed element in a list.
-    Index { index: u32, inner: Box<BinParseError> },
+    Index {
+        index: u32,
+        inner: Box<BinParseError>,
+    },
     /// Ran out of bytes mid-parse.
     UnexpectedEnd,
     /// A field-control parse failure (wrong CRC id, wire-level error).
     Control(ParseControlError),
     /// An entry offset table had a gap.
-    InvalidOffset { start: usize, end: usize, expected: usize },
+    InvalidOffset {
+        start: usize,
+        end: usize,
+        expected: usize,
+    },
     /// Entry name not found in the names table.
-    NoNameEntry { position: u32 },
+    NoNameEntry {
+        position: u32,
+    },
     /// Trailing bytes after all entries in a chunk.
-    TrailingBytes { position: u32, remaining: usize, name: String },
+    TrailingBytes {
+        position: u32,
+        remaining: usize,
+        name: String,
+    },
 }
 
 impl From<io::Error> for BinParseError {
-    fn from(e: io::Error) -> Self { BinParseError::Io(e) }
+    fn from(e: io::Error) -> Self {
+        BinParseError::Io(e)
+    }
 }
 
 impl From<TakeError> for BinParseError {
@@ -55,7 +73,9 @@ impl From<TakeError> for BinParseError {
 }
 
 impl From<ParseControlError> for BinParseError {
-    fn from(e: ParseControlError) -> Self { BinParseError::Control(e) }
+    fn from(e: ParseControlError) -> Self {
+        BinParseError::Control(e)
+    }
 }
 
 impl DefBinary {
@@ -83,8 +103,7 @@ impl DefBinary {
 
         let header = DefBinaryHeader::parse(bytes_cursor)?;
 
-        let name_refs =
-            NameRef::parse_list(bytes_cursor, header.entry_count)?;
+        let name_refs = NameRef::parse_list(bytes_cursor, header.entry_count)?;
 
         let chunk_index = ChunkIndex::parse(bytes_cursor)?;
 
@@ -109,14 +128,28 @@ pub struct DefBinaryHeader {
 
 impl DefBinaryHeader {
     fn parse(cur: &mut &[u8]) -> Result<Self, BinParseError> {
-        let use_names_bin = take::<u8>(cur)
-            .map_err(|e| BinParseError::Field { name: "use_names_bin", inner: Box::new(e.into()) })? == 0x1;
+        let use_names_bin = take::<u8>(cur).map_err(|e| BinParseError::Field {
+            name: "use_names_bin",
+            inner: Box::new(e.into()),
+        })? == 0x1;
         let file_indicator = take::<u32>(cur)
-            .map_err(|e| BinParseError::Field { name: "file_indicator", inner: Box::new(e.into()) })?.to_le();
+            .map_err(|e| BinParseError::Field {
+                name: "file_indicator",
+                inner: Box::new(e.into()),
+            })?
+            .to_le();
         let platform_indicator = take::<u32>(cur)
-            .map_err(|e| BinParseError::Field { name: "platform_indicator", inner: Box::new(e.into()) })?.to_le();
+            .map_err(|e| BinParseError::Field {
+                name: "platform_indicator",
+                inner: Box::new(e.into()),
+            })?
+            .to_le();
         let entry_count = take::<u32>(cur)
-            .map_err(|e| BinParseError::Field { name: "entry_count", inner: Box::new(e.into()) })?.to_le();
+            .map_err(|e| BinParseError::Field {
+                name: "entry_count",
+                inner: Box::new(e.into()),
+            })?
+            .to_le();
         Ok(Self {
             use_names_bin,
             file_indicator,
@@ -146,8 +179,12 @@ pub struct NameRef {
 impl NameRef {
     fn parse_list(cur: &mut &[u8], count: u32) -> Result<Vec<NameRef>, BinParseError> {
         (0..count)
-            .map(|i| Self::parse(cur)
-                .map_err(|e| BinParseError::Index { index: i, inner: Box::new(e) }))
+            .map(|i| {
+                Self::parse(cur).map_err(|e| BinParseError::Index {
+                    index: i,
+                    inner: Box::new(e),
+                })
+            })
             .collect()
     }
 }
@@ -155,11 +192,23 @@ impl NameRef {
 impl NameRef {
     fn parse(cur: &mut &[u8]) -> Result<Self, BinParseError> {
         let def_name_offset = take::<u32>(cur)
-            .map_err(|e| BinParseError::Field { name: "def_name_offset", inner: Box::new(e.into()) })?.to_le();
+            .map_err(|e| BinParseError::Field {
+                name: "def_name_offset",
+                inner: Box::new(e.into()),
+            })?
+            .to_le();
         let file_name_offset = take::<u32>(cur)
-            .map_err(|e| BinParseError::Field { name: "file_name_offset", inner: Box::new(e.into()) })?.to_le();
+            .map_err(|e| BinParseError::Field {
+                name: "file_name_offset",
+                inner: Box::new(e.into()),
+            })?
+            .to_le();
         let counter = take::<u32>(cur)
-            .map_err(|e| BinParseError::Field { name: "counter", inner: Box::new(e.into()) })?.to_le();
+            .map_err(|e| BinParseError::Field {
+                name: "counter",
+                inner: Box::new(e.into()),
+            })?
+            .to_le();
         Ok(Self {
             def_name_offset,
             file_name_offset,
@@ -207,9 +256,17 @@ pub struct ChunkIndexHeader {
 impl ChunkIndexHeader {
     fn parse(cur: &mut &[u8]) -> Result<Self, BinParseError> {
         let chunk_count = take::<u32>(cur)
-            .map_err(|e| BinParseError::Field { name: "chunk_count", inner: Box::new(e.into()) })?.to_le();
+            .map_err(|e| BinParseError::Field {
+                name: "chunk_count",
+                inner: Box::new(e.into()),
+            })?
+            .to_le();
         let reserved = take::<u32>(cur)
-            .map_err(|e| BinParseError::Field { name: "reserved", inner: Box::new(e.into()) })?.to_le();
+            .map_err(|e| BinParseError::Field {
+                name: "reserved",
+                inner: Box::new(e.into()),
+            })?
+            .to_le();
         Ok(Self {
             chunk_count,
             reserved,
@@ -234,9 +291,17 @@ pub struct ChunkIndexEntry {
 impl ChunkIndexEntry {
     fn parse(cur: &mut &[u8]) -> Result<Self, BinParseError> {
         let compressed_offset = take::<u32>(cur)
-            .map_err(|e| BinParseError::Field { name: "compressed_offset", inner: Box::new(e.into()) })?.to_le();
+            .map_err(|e| BinParseError::Field {
+                name: "compressed_offset",
+                inner: Box::new(e.into()),
+            })?
+            .to_le();
         let cumulative_entry_count = take::<u32>(cur)
-            .map_err(|e| BinParseError::Field { name: "cumulative_entry_count", inner: Box::new(e.into()) })?.to_le();
+            .map_err(|e| BinParseError::Field {
+                name: "cumulative_entry_count",
+                inner: Box::new(e.into()),
+            })?
+            .to_le();
         Ok(Self {
             compressed_offset,
             cumulative_entry_count,
@@ -452,7 +517,11 @@ impl EntryRecord {
 
         for _ in 0..chunk_entry_count {
             let offset = take::<u16>(cur)
-                .map_err(|e| BinParseError::Field { name: "offset", inner: Box::new(e.into()) })?.to_le();
+                .map_err(|e| BinParseError::Field {
+                    name: "offset",
+                    inner: Box::new(e.into()),
+                })?
+                .to_le();
             offsets.push(offset)
         }
 
@@ -488,14 +557,17 @@ impl EntryRecord {
 
             match entry_name {
                 Some(entry_name) => {
-                    let mut entry_bytes = take_bytes(cur, entry_len)
-                        .map_err(|_| BinParseError::UnexpectedEnd)?;
+                    let mut entry_bytes =
+                        take_bytes(cur, entry_len).map_err(|_| BinParseError::UnexpectedEnd)?;
 
                     let entry_bytes_cursor = &mut entry_bytes;
 
                     let entry_record =
                         EntryRecord::parse(entry_bytes_cursor, entry_name, chunk_start, chunk_end)
-                            .map_err(|error| BinParseError::Index { index: entry_position, inner: Box::new(error) })?;
+                            .map_err(|error| BinParseError::Index {
+                                index: entry_position,
+                                inner: Box::new(error),
+                            })?;
 
                     if !entry_bytes_cursor.is_empty() {
                         return Err(BinParseError::TrailingBytes {
@@ -532,11 +604,17 @@ impl EntryRecord {
 
         let sub_defs = if def_name_has_subdef_table(&name.string) {
             let count = take::<u16>(cur)
-                .map_err(|e| BinParseError::Field { name: "sub_def_count", inner: Box::new(e.into()) })?.to_le();
+                .map_err(|e| BinParseError::Field {
+                    name: "sub_def_count",
+                    inner: Box::new(e.into()),
+                })?
+                .to_le();
             let mut records = Vec::with_capacity(count as usize);
             for _ in 0..count {
-                records.push(SubDefRecord::parse(cur)
-                    .map_err(|e| BinParseError::Field { name: "sub_def", inner: Box::new(e.into()) })?);
+                records.push(SubDefRecord::parse(cur).map_err(|e| BinParseError::Field {
+                    name: "sub_def",
+                    inner: Box::new(e.into()),
+                })?);
             }
             Some(records)
         } else {
@@ -544,8 +622,8 @@ impl EntryRecord {
         };
 
         let mut attempt = *cur;
-        let body = DefBody::parse(&mut attempt, &name.string)
-            .map_err(|(_, e)| BinParseError::from(e))?;
+        let body =
+            DefBody::parse(&mut attempt, &name.string).map_err(|(_, e)| BinParseError::from(e))?;
         *cur = attempt;
 
         Ok(Self {
@@ -1041,12 +1119,18 @@ pub struct EntryPreamble {
 
 impl EntryPreamble {
     fn parse(cur: &mut &[u8]) -> Result<Self, BinParseError> {
-        let is_real = take::<u8>(cur)
-            .map_err(|e| BinParseError::Field { name: "is_real", inner: Box::new(e.into()) })? == 0x1;
-        let is_template = take::<u8>(cur)
-            .map_err(|e| BinParseError::Field { name: "is_template", inner: Box::new(e.into()) })? == 0x1;
-        let unknown_0 = take::<u8>(cur)
-            .map_err(|e| BinParseError::Field { name: "unknown_0", inner: Box::new(e.into()) })?;
+        let is_real = take::<u8>(cur).map_err(|e| BinParseError::Field {
+            name: "is_real",
+            inner: Box::new(e.into()),
+        })? == 0x1;
+        let is_template = take::<u8>(cur).map_err(|e| BinParseError::Field {
+            name: "is_template",
+            inner: Box::new(e.into()),
+        })? == 0x1;
+        let unknown_0 = take::<u8>(cur).map_err(|e| BinParseError::Field {
+            name: "unknown_0",
+            inner: Box::new(e.into()),
+        })?;
         Ok(Self {
             is_real,
             is_template,
@@ -1196,10 +1280,7 @@ pub const ID_BYTE_SIZE: usize = size_of::<u32>();
 #[derive(Debug)]
 pub enum ParseControlErrorReason {
     MalformedId(TakeError),
-    WrongId {
-        expected: u32,
-        found: u32,
-    },
+    WrongId { expected: u32, found: u32 },
     Wire(ParseWireError),
 }
 

@@ -1,11 +1,7 @@
 use crate::DefStruct;
 use crate::def::{
-    enums::SwitchTriggerType,
-    values::ThingComponentSet,
-    wire::DefIndex,
-    wire::DefString,
+    enums::SwitchTriggerType, values::ThingComponentSet, wire::DefIndex, wire::DefString,
 };
-
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]
 pub struct ThingSwitchDef {

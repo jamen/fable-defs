@@ -1,8 +1,5 @@
 use crate::DefStruct;
-use crate::def::{
-    wire::VecMap,
-};
-
+use crate::def::wire::VecMap;
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]
 pub struct RumbleDef {

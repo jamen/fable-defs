@@ -21,6 +21,9 @@ pub struct CameraManagerDef {
     pub max_height_relative_to_ground: f32,
     #[def("MaxHeightStepForPointAcceptance", default = 3.0)]
     pub max_height_step_for_point_acceptance: f32,
-    #[def("AngleBetweenGroundNormalAndVerticalForLandscapeToBeConsideredNotFlat", default = 30.0)]
+    #[def(
+        "AngleBetweenGroundNormalAndVerticalForLandscapeToBeConsideredNotFlat",
+        default = 30.0
+    )]
     pub angle_between_ground_normal_and_vertical_for_landscape_to_be_considered_not_flat: f32,
 }

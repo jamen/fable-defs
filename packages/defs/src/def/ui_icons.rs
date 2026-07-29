@@ -67,4 +67,3 @@ pub struct UiIconsDef {
     #[def("IconListHighlight")]
     pub icon_list_highlight: u32,
 }
-

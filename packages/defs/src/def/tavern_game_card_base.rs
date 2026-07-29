@@ -1,13 +1,8 @@
 use crate::DefStruct;
 use crate::def::{
-    CardDef,
-    CardPositionsDef,
-    enums::TavernGameControlType,
-    values::RGBColour,
-    values::Vector2D,
+    CardDef, CardPositionsDef, enums::TavernGameControlType, values::RGBColour, values::Vector2D,
     wire::DefIndex,
 };
-
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]
 pub struct TavernGameCardBaseDef {

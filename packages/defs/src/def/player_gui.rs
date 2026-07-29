@@ -1,8 +1,8 @@
 use crate::DefStruct;
 use crate::def::{
-    {AbilityButtonGuiDef, QuickAccessItemButtonGuiDef},
     values::{MiniMapGraphics, RGBColour, Vector2D, Vector3D},
     wire::VecMap,
+    {AbilityButtonGuiDef, QuickAccessItemButtonGuiDef},
 };
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]

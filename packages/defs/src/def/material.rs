@@ -1,8 +1,5 @@
 use crate::DefStruct;
-use crate::def::{
-    values::BlendedParticleEffectSet,
-    wire::VecMap,
-};
+use crate::def::{values::BlendedParticleEffectSet, wire::VecMap};
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]
 pub struct MaterialDef {

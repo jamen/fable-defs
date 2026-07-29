@@ -11,10 +11,7 @@ pub mod reader;
 
 pub use self::reader::{Args, DefReader, DefReaderError, EvalError, Evaluator};
 
-pub use self::lower::{
-    LowerEnv, LowerError, NoEnv, flatten_specialization,
-    lower_controls, lower_def, lower_front_end, lower_generic, lower_ui, lower_ui_misc_things,
-};
+pub use self::lower::{LowerError, flatten_specialization, lower_def};
 
 use std::path::{Path, PathBuf};
 
@@ -33,7 +30,10 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
         let path = entry.path();
         if path.is_dir() {
             collect(&path, out);
-        } else if matches!(path.extension().and_then(|e| e.to_str()), Some("def") | Some("tpl")) {
+        } else if matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("def") | Some("tpl")
+        ) {
             out.push(path);
         }
     }

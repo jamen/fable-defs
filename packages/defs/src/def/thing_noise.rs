@@ -1,11 +1,5 @@
 use crate::DefStruct;
-use crate::def::{
-    TCNoiseDef,
-    values::ThingComponentSet,
-    wire::DefIndex,
-    wire::DefString,
-};
-
+use crate::def::{TCNoiseDef, values::ThingComponentSet, wire::DefIndex, wire::DefString};
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]
 pub struct ThingNoiseDef {

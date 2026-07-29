@@ -1,5 +1,5 @@
-use crate::wire::DefIndex;
 use crate::DefStruct;
+use crate::wire::DefIndex;
 use crate::wire::DefString;
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]

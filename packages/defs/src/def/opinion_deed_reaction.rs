@@ -1,8 +1,5 @@
 use crate::DefStruct;
-use crate::def::{
-    enums::OpinionAttitudeType,
-    wire::DefString,
-};
+use crate::def::{enums::OpinionAttitudeType, wire::DefString};
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]
 pub struct OpinionDeedReactionDef {

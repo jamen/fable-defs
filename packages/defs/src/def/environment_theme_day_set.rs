@@ -25,4 +25,3 @@ pub struct EnvironmentThemeDaySetDef {
     #[def("FishWeightMult", default = 1.0)]
     pub fish_weight_mult: f32,
 }
-

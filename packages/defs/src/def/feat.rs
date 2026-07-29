@@ -1,8 +1,5 @@
 use crate::DefStruct;
-use crate::def::{
-    enums::FeatAttackType,
-    wire::DefString,
-};
+use crate::def::{enums::FeatAttackType, wire::DefString};
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]
 pub struct FeatDef {

@@ -1,8 +1,5 @@
 use crate::DefStruct;
-use crate::def::{
-    values::Vector2D,
-};
-
+use crate::def::values::Vector2D;
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]
 pub struct QuickAccessItemButtonGuiDef {

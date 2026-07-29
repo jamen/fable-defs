@@ -16,7 +16,11 @@ use defs::def::text::{
 
 /// If `stmt` is a leaf field whose path is exactly `name` at `depth` (i.e. ends there), return its
 /// value expression. Used by the by-name leaf accessors so the path-matching lives in one place.
-fn leaf_field<'a>(stmt: &'a Spanned<Statement>, depth: usize, name: &str) -> Option<&'a Spanned<Expr>> {
+fn leaf_field<'a>(
+    stmt: &'a Spanned<Statement>,
+    depth: usize,
+    name: &str,
+) -> Option<&'a Spanned<Expr>> {
     let Statement::Field(field) = &stmt.value else {
         return None;
     };
@@ -43,7 +47,8 @@ pub(crate) fn is_null_ref(name: &str) -> bool {
 /// Parse an integer-shaped [`Expr::Number`] source (`-?[0-9]+`) as `i64`. The
 /// lexer already validated the shape, so this only fails on `i64` overflow.
 fn parse_number_i64(s: &str) -> Result<i64, EvalError> {
-    s.parse::<i64>().map_err(|_| EvalError::InvalidNumber(s.to_string()))
+    s.parse::<i64>()
+        .map_err(|_| EvalError::InvalidNumber(s.to_string()))
 }
 
 /// Parse a float-shaped [`Expr::Number`] source as `f32`, stripping a trailing
@@ -154,7 +159,10 @@ impl<'s> Evaluator<'s> {
             Expr::Add(parts) => parts.iter().try_fold(0i32, |acc, p| {
                 acc.checked_add(self.i32(p)?).ok_or(E::Overflow)
             }),
-            other => Err(E::TypeMismatch { expected: "a number", found: expr_kind_name(other) }),
+            other => Err(E::TypeMismatch {
+                expected: "a number",
+                found: expr_kind_name(other),
+            }),
         }
     }
 
@@ -181,7 +189,10 @@ impl<'s> Evaluator<'s> {
             Expr::Add(parts) => parts.iter().try_fold(0u32, |acc, p| {
                 acc.checked_add(self.u32(p)?).ok_or(E::Overflow)
             }),
-            other => Err(E::TypeMismatch { expected: "a number", found: expr_kind_name(other) }),
+            other => Err(E::TypeMismatch {
+                expected: "a number",
+                found: expr_kind_name(other),
+            }),
         }
     }
 
@@ -199,7 +210,10 @@ impl<'s> Evaluator<'s> {
                 .map(|v| v as f32)
                 .ok_or_else(|| E::UnknownSymbol(name.clone())),
             Expr::Add(parts) => parts.iter().try_fold(0f32, |acc, p| Ok(acc + self.f32(p)?)),
-            other => Err(E::TypeMismatch { expected: "a number", found: expr_kind_name(other) }),
+            other => Err(E::TypeMismatch {
+                expected: "a number",
+                found: expr_kind_name(other),
+            }),
         }
     }
 
@@ -208,7 +222,10 @@ impl<'s> Evaluator<'s> {
             Expr::Bool(b) => Ok(*b),
             Expr::Symbol(s) if s == "true" || s == "TRUE" => Ok(true),
             Expr::Symbol(s) if s == "false" || s == "FALSE" => Ok(false),
-            other => Err(EvalError::TypeMismatch { expected: "a boolean", found: expr_kind_name(other) }),
+            other => Err(EvalError::TypeMismatch {
+                expected: "a boolean",
+                found: expr_kind_name(other),
+            }),
         }
     }
 
@@ -216,7 +233,10 @@ impl<'s> Evaluator<'s> {
         match &expr.value {
             Expr::String(s) => Ok(s),
             Expr::Symbol(s) => Ok(s),
-            other => Err(EvalError::TypeMismatch { expected: "a string", found: expr_kind_name(other) }),
+            other => Err(EvalError::TypeMismatch {
+                expected: "a string",
+                found: expr_kind_name(other),
+            }),
         }
     }
 
@@ -248,32 +268,45 @@ impl<'s> Evaluator<'s> {
 impl<'s> Evaluator<'s> {
     /// Fallible positional-arg accessor: eval arg `idx` as i32, default on error.
     pub fn arg_i32_or(&self, args: &[Spanned<Expr>], idx: usize, default: i32) -> i32 {
-        args.get(idx).and_then(|e| self.i32(e).ok()).unwrap_or(default)
+        args.get(idx)
+            .and_then(|e| self.i32(e).ok())
+            .unwrap_or(default)
     }
 
     /// Fallible positional-arg accessor: eval arg `idx` as f32, default on error.
     pub fn arg_f32_or(&self, args: &[Spanned<Expr>], idx: usize, default: f32) -> f32 {
-        args.get(idx).and_then(|e| self.f32(e).ok()).unwrap_or(default)
+        args.get(idx)
+            .and_then(|e| self.f32(e).ok())
+            .unwrap_or(default)
     }
 
     /// Fallible positional-arg accessor: eval arg `idx` as u32, default on error.
     pub fn arg_u32_or(&self, args: &[Spanned<Expr>], idx: usize, default: u32) -> u32 {
-        args.get(idx).and_then(|e| self.u32(e).ok()).unwrap_or(default)
+        args.get(idx)
+            .and_then(|e| self.u32(e).ok())
+            .unwrap_or(default)
     }
 
     /// Fallible positional-arg accessor: eval arg `idx` as bool, default on error.
     pub fn arg_bool_or(&self, args: &[Spanned<Expr>], idx: usize, default: bool) -> bool {
-        args.get(idx).and_then(|e| self.bool(e).ok()).unwrap_or(default)
+        args.get(idx)
+            .and_then(|e| self.bool(e).ok())
+            .unwrap_or(default)
     }
 
     /// Fallible positional-arg accessor: eval arg `idx` as String, default on error.
     pub fn arg_string_or(&self, args: &[Spanned<Expr>], idx: usize, default: &str) -> String {
-        args.get(idx).and_then(|e| self.string(e).ok()).map(String::from).unwrap_or_else(|| default.to_string())
+        args.get(idx)
+            .and_then(|e| self.string(e).ok())
+            .map(String::from)
+            .unwrap_or_else(|| default.to_string())
     }
 
     /// Fallible positional-arg accessor: eval arg `idx` as String, None on missing/discordant.
     pub fn arg_string_opt(&self, args: &[Spanned<Expr>], idx: usize) -> Option<String> {
-        args.get(idx).and_then(|e| self.string(e).ok()).map(String::from)
+        args.get(idx)
+            .and_then(|e| self.string(e).ok())
+            .map(String::from)
     }
 }
 
@@ -296,7 +329,9 @@ impl<'s> Evaluator<'s> {
     }
     pub fn eval_string(&self, expr: &Spanned<Expr>) -> Result<String, DefReaderError> {
         let span = expr.span;
-        self.string(expr).map(|s| s.to_string()).map_err(|e| DefReaderError::Eval(e, span))
+        self.string(expr)
+            .map(|s| s.to_string())
+            .map_err(|e| DefReaderError::Eval(e, span))
     }
     pub fn eval_usize(&self, expr: &Spanned<Expr>) -> Result<usize, DefReaderError> {
         let span = expr.span;
@@ -330,31 +365,41 @@ impl<'e, 's> Args<'e, 's> {
     }
 
     fn get(&self, idx: usize) -> Result<&'e Spanned<Expr>, DefReaderError> {
-        self.args.get(idx).ok_or(DefReaderError::MissingArg(idx, Span { start: 0, end: 0 }))
+        self.args
+            .get(idx)
+            .ok_or(DefReaderError::MissingArg(idx, Span { start: 0, end: 0 }))
     }
 
     pub fn i32(&self, idx: usize) -> Result<i32, DefReaderError> {
         let expr = self.get(idx)?;
         let span = expr.span;
-        self.eval.i32(expr).map_err(|e| DefReaderError::Eval(e, span))
+        self.eval
+            .i32(expr)
+            .map_err(|e| DefReaderError::Eval(e, span))
     }
 
     pub fn u32(&self, idx: usize) -> Result<u32, DefReaderError> {
         let expr = self.get(idx)?;
         let span = expr.span;
-        self.eval.u32(expr).map_err(|e| DefReaderError::Eval(e, span))
+        self.eval
+            .u32(expr)
+            .map_err(|e| DefReaderError::Eval(e, span))
     }
 
     pub fn f32(&self, idx: usize) -> Result<f32, DefReaderError> {
         let expr = self.get(idx)?;
         let span = expr.span;
-        self.eval.f32(expr).map_err(|e| DefReaderError::Eval(e, span))
+        self.eval
+            .f32(expr)
+            .map_err(|e| DefReaderError::Eval(e, span))
     }
 
     pub fn bool(&self, idx: usize) -> Result<bool, DefReaderError> {
         let expr = self.get(idx)?;
         let span = expr.span;
-        self.eval.bool(expr).map_err(|e| DefReaderError::Eval(e, span))
+        self.eval
+            .bool(expr)
+            .map_err(|e| DefReaderError::Eval(e, span))
     }
 
     pub fn string(&self, idx: usize) -> Result<String, DefReaderError> {
@@ -373,7 +418,10 @@ impl<'e, 's> Args<'e, 's> {
     pub fn ctor(&self, idx: usize, name: &'static str) -> Result<Args<'e, 's>, DefReaderError> {
         let expr = self.get(idx)?;
         let span = expr.span;
-        let call = self.eval.call(expr, name).map_err(|e| DefReaderError::Eval(e, span))?;
+        let call = self
+            .eval
+            .call(expr, name)
+            .map_err(|e| DefReaderError::Eval(e, span))?;
         Ok(Args::new(&call.arguments, self.eval))
     }
 }
@@ -437,58 +485,6 @@ impl<'a, 's> DefReader<'a, 's> {
         }
     }
 
-    // ── leaf accessors ──────────────────────────────────────────────────────
-
-    /// Find the value of leaf field `name`, consuming every matching statement.
-    /// When the field appears more than once (specialization chains concatenate
-    /// parent and child bodies), the LAST occurrence wins — matching the game
-    /// compiler's copy-then-override semantics.
-    fn find_leaf(&mut self, name: &'static str) -> Result<&'a Spanned<Expr>, DefReaderError> {
-        self.find_opt_leaf(name)
-            .ok_or(DefReaderError::MissingField(name, Span { start: 0, end: 0 }))
-    }
-
-    pub fn i32(&mut self, name: &'static str) -> Result<i32, DefReaderError> {
-        let expr = self.find_leaf(name)?;
-        let span = expr.span;
-        self.eval.i32(expr).map_err(|e| DefReaderError::Eval(e, span))
-    }
-
-    pub fn u32(&mut self, name: &'static str) -> Result<u32, DefReaderError> {
-        let expr = self.find_leaf(name)?;
-        let span = expr.span;
-        self.eval
-            .u32(expr)
-            .map_err(|e| DefReaderError::Eval(e, span))
-    }
-
-    pub fn f32(&mut self, name: &'static str) -> Result<f32, DefReaderError> {
-        let expr = self.find_leaf(name)?;
-        let span = expr.span;
-        self.eval
-            .f32(expr)
-            .map_err(|e| DefReaderError::Eval(e, span))
-    }
-
-    pub fn bool(&mut self, name: &'static str) -> Result<bool, DefReaderError> {
-        let expr = self.find_leaf(name)?;
-        let span = expr.span;
-        self.eval
-            .bool(expr)
-            .map_err(|e| DefReaderError::Eval(e, span))
-    }
-
-    pub fn string(&mut self, name: &'static str) -> Result<String, DefReaderError> {
-        let expr = self.find_leaf(name)?;
-        let span = expr.span;
-        self.eval
-            .string(expr)
-            .map(|s| s.to_string())
-            .map_err(|e| DefReaderError::Eval(e, span))
-    }
-
-    // ── optional accessors ──────────────────────────────────────────────────
-
     fn find_opt_leaf(&mut self, name: &'static str) -> Option<&'a Spanned<Expr>> {
         let mut found: Option<&'a Spanned<Expr>> = None;
         for entry in self.entries.iter_mut() {
@@ -503,57 +499,9 @@ impl<'a, 's> DefReader<'a, 's> {
         found
     }
 
-    pub fn opt_i32(&mut self, name: &'static str) -> Result<Option<i32>, DefReaderError> {
-        self.find_opt_leaf(name)
-            .map(|e| {
-                let span = e.span;
-                self.eval.i32(e).map_err(|err| DefReaderError::Eval(err, span))
-            })
-            .transpose()
-    }
-
-    pub fn opt_u32(&mut self, name: &'static str) -> Result<Option<u32>, DefReaderError> {
-        self.find_opt_leaf(name)
-            .map(|e| {
-                let span = e.span;
-                self.eval.u32(e).map_err(|err| DefReaderError::Eval(err, span))
-            })
-            .transpose()
-    }
-
-    pub fn opt_f32(&mut self, name: &'static str) -> Result<Option<f32>, DefReaderError> {
-        self.find_opt_leaf(name)
-            .map(|e| {
-                let span = e.span;
-                self.eval.f32(e).map_err(|err| DefReaderError::Eval(err, span))
-            })
-            .transpose()
-    }
-
-    pub fn opt_bool(&mut self, name: &'static str) -> Result<Option<bool>, DefReaderError> {
-        self.find_opt_leaf(name)
-            .map(|e| {
-                let span = e.span;
-                self.eval.bool(e).map_err(|err| DefReaderError::Eval(err, span))
-            })
-            .transpose()
-    }
-
-    pub fn opt_string(&mut self, name: &'static str) -> Result<Option<String>, DefReaderError> {
-        self.find_opt_leaf(name)
-            .map(|e| {
-                let span = e.span;
-                self.eval
-                    .string(e)
-                    .map(|s| s.to_string())
-                    .map_err(|err| DefReaderError::Eval(err, span))
-            })
-            .transpose()
-    }
-
-    /// Like [`DefReader::find_opt_leaf`] but exposes the raw expression, for
-    /// callers that need to distinguish string literals from symbols (e.g.
-    /// `CDefString` fields). Consumes all matching statements (last wins).
+    /// Consume the last matching leaf field `name` and return its raw expression,
+    /// or `None` if no matching statement exists. Callers that need typed access
+    /// can evaluate the expression with [`Evaluator`] methods.
     pub fn opt_expr(&mut self, name: &'static str) -> Option<&'a Spanned<Expr>> {
         self.find_opt_leaf(name)
     }
@@ -581,22 +529,6 @@ impl<'a, 's> DefReader<'a, 's> {
             }
         }
         found
-    }
-
-    // ── constructor ─────────────────────────────────────────────────────────
-
-    pub fn ctor(
-        &mut self,
-        name: &'static str,
-        ctor_name: &'static str,
-    ) -> Result<Args<'a, 's>, DefReaderError> {
-        let expr = self.find_leaf(name)?;
-        let span = expr.span;
-        let call = self
-            .eval
-            .call(expr, ctor_name)
-            .map_err(|e| DefReaderError::Eval(e, span))?;
-        Ok(Args::new(&call.arguments, self.eval))
     }
 
     pub fn eval(&self) -> Evaluator<'s> {
@@ -810,7 +742,10 @@ impl<'a, 's> DefReader<'a, 's> {
                 }
             }
         }
-        found.ok_or(DefReaderError::MissingField("(any)", Span { start: 0, end: 0 }))
+        found.ok_or(DefReaderError::MissingField(
+            "(any)",
+            Span { start: 0, end: 0 },
+        ))
     }
 
     pub fn any_i32(&mut self) -> Result<i32, DefReaderError> {

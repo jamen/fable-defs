@@ -45,4 +45,3 @@ pub struct EngineVideoOptionsDef {
     #[def("EnableRepeatedMeshes", default = true)]
     pub enable_repeated_meshes: bool,
 }
-

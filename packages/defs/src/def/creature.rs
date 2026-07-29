@@ -1,8 +1,8 @@
 use crate::DefStruct;
-use crate::wire::DefIndex;
 use crate::def::CreatureStatsDef;
 use crate::enums::Opinion;
 use crate::values::{ExpressionSet, FloatRange, RandomAppearanceMorph, WoundMorphs};
+use crate::wire::DefIndex;
 use crate::wire::{DefString, VecMap};
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]

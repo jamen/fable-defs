@@ -161,7 +161,13 @@ fn named_fields(fields: &Fields, ctx: &str) -> Vec<syn::Field> {
 /// Generate a `StructSlot` impl for a struct with positional member access.
 /// `include_visit_named` controls whether the struct exposes its fields by
 /// def-script name (DefStruct types that appear as Vec elements / map values).
-fn gen_struct_slot(name: &Ident, idents: &[Ident], member_names: &[String], type_name: &str, include_visit_named: bool) -> TokenStream2 {
+fn gen_struct_slot(
+    name: &Ident,
+    idents: &[Ident],
+    member_names: &[String],
+    type_name: &str,
+    include_visit_named: bool,
+) -> TokenStream2 {
     let visit_named = if include_visit_named {
         quote! {
             fn visit_named(&mut self, visitor: &mut dyn crate::visit::FieldVisitor) -> bool {

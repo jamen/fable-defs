@@ -1,7 +1,7 @@
 use crate::DefStruct;
-use crate::wire::DefIndex;
 use crate::enums::{ClothingSuitPart, HeroAttachableAppearanceModifierType};
 use crate::values::AppearanceModifierGraphics;
+use crate::wire::DefIndex;
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]
 pub struct AppearanceModifierDef {

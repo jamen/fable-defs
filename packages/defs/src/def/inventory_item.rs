@@ -1,7 +1,7 @@
 use crate::DefStruct;
 use crate::enums::{GameAction, TutorialCategory};
-use crate::wire::DefIndex;
 use crate::values::EngineGraphic;
+use crate::wire::DefIndex;
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]
 pub struct InventoryItemDef {

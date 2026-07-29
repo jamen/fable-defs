@@ -1,8 +1,5 @@
 use crate::DefStruct;
-use crate::def::{
-    values::RGBColour,
-};
-
+use crate::def::values::RGBColour;
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]
 pub struct SpotLightDef {

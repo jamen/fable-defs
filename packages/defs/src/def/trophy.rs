@@ -1,9 +1,5 @@
 use crate::DefStruct;
-use crate::def::{
-    wire::DefIndex,
-    wire::DefString,
-};
-
+use crate::def::{wire::DefIndex, wire::DefString};
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]
 pub struct TrophyDef {

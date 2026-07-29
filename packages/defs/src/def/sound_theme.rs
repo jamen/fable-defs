@@ -1,9 +1,5 @@
 use crate::DefStruct;
-use crate::def::{
-    values::RGBColour,
-    wire::VecMap,
-};
-
+use crate::def::{values::RGBColour, wire::VecMap};
 
 #[derive(Debug, Clone, PartialEq, DefStruct)]
 pub struct SoundThemeDef {
