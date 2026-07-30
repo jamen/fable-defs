@@ -6,43 +6,297 @@
 //!
 //! The pipeline has three phases:
 //! 1. **[`parse_corpus`]** — parse every `.def`/`.tpl` file once, loading all
-//!    header symbols, building the unified diagnostics store, and producing the
-//!    shared [`ParsedCorpus`].
+//!    header symbols, registering every source file, and producing the shared
+//!    [`ParsedCorpus`].
 //! 2. **[`build_one_bin`]** — for each binary, filter the corpus by manifest
 //!    membership, allocate indices, lower, and serialize. Driven by a
 //!    [`BinConfig`].
 //! 3. **Finalize** — write `names.bin` from the shared [`NamesBuilder`].
+//!
+//! Diagnostics are **collected, not rendered**: everything the build has to say
+//! about the corpus lands in [`BuildReport::diagnostics`] (or
+//! [`BuildError::diagnostics`]) with the source spans intact, so the caller
+//! owns presentation. [`BuildReport::sources`] carries the source text the
+//! spans point into.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use codespan_reporting::diagnostic::{Diagnostic, Label};
-use codespan_reporting::files::{Files, SimpleFiles};
-use codespan_reporting::term::{self, Styles, StylesWriter, termcolor::StandardStream};
-use def_compiler::{LowerError, flatten_specialization, lower_def, walk_def_files};
-use defs::crc32;
-use defs::def::binary::{
+use defs::binary::{
     Chunk, ChunkIndex, ChunkIndexEntry, ChunkIndexHeader, DefBinary, DefBinaryHeader, DefBody,
     EntryPreamble, EntryRecord, NameRef, SubDefRecord, def_name_has_subdef_table,
 };
-use defs::def::text::{
+use defs::crc32;
+use defs::text::{
     DefFile, DefParseError, Definition, Expr, Span, Spanned, Statement, SymbolTable,
     TextParseErrorKind, header::parse_header_file, parse_def_file,
 };
 use defs::names::NamesBuilder;
 
-fn emit_diagnostic(files: &SimpleFiles<String, String>, diag: &Diagnostic<usize>) {
-    let writer = StandardStream::stderr(termcolor::ColorChoice::Auto);
-    let config = term::Config::default();
-    let styles = Styles::default();
-    let _ = term::emit_to_write_style(
-        &mut StylesWriter::new(writer, &styles),
-        &config,
-        files,
-        diag,
-    );
+use crate::lower::{LowerError, flatten_specialization, lower_def};
+use crate::manifest;
+use crate::walk_def_files;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Public API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// One source file the build read, kept so diagnostic spans can be resolved
+/// back to text by whoever renders them.
+#[derive(Debug, Clone)]
+pub struct SourceFile {
+    /// Path as given on disk, with separators normalized to `/`.
+    pub path: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    Warning,
+    Error,
+}
+
+/// A span within a diagnostic's source file, optionally annotated.
+#[derive(Debug, Clone)]
+pub struct DiagnosticLabel {
+    /// `true` for the span the diagnostic is *about*; `false` for supporting
+    /// context (e.g. "in this definition").
+    pub primary: bool,
+    pub span: Span,
+    pub message: Option<String>,
+}
+
+/// One thing the build has to say about the corpus.
+///
+/// `source` indexes [`BuildReport::sources`] / [`BuildError::sources`]. It is
+/// `None` for diagnostics with no registered source file (header files, which
+/// are not retained), in which case `message` names the file itself.
+#[derive(Debug, Clone)]
+pub struct BuildDiagnostic {
+    pub severity: Severity,
+    pub message: String,
+    pub source: Option<usize>,
+    pub labels: Vec<DiagnosticLabel>,
+}
+
+impl BuildDiagnostic {
+    fn bare(severity: Severity, message: String) -> Self {
+        Self {
+            severity,
+            message,
+            source: None,
+            labels: Vec::new(),
+        }
+    }
+}
+
+/// Per-binary outcome.
+#[derive(Debug, Clone)]
+pub struct BinSummary {
+    pub label: &'static str,
+    pub file_name: &'static str,
+    /// Named definitions successfully lowered.
+    pub lowered: usize,
+    /// Total entries written (NULLDEF + named + anonymous sub-defs).
+    pub entries: u32,
+    pub has_sub_defs: bool,
+    pub sub_defs_lowered: usize,
+    /// Distinct anonymous sub-def entries after `(tag, bytes)` dedup.
+    pub sub_defs_unique: usize,
+}
+
+/// A successful build.
+#[derive(Debug)]
+pub struct BuildReport {
+    pub sources: Vec<SourceFile>,
+    /// Warnings only — any error fails the build (see [`BuildError`]).
+    pub diagnostics: Vec<BuildDiagnostic>,
+    pub bins: Vec<BinSummary>,
+    pub elapsed: Duration,
+}
+
+impl BuildReport {
+    pub fn warnings(&self) -> impl Iterator<Item = &BuildDiagnostic> {
+        self.diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Warning)
+    }
+}
+
+/// A failed build. Carries the diagnostics collected before the failure so the
+/// caller can report *why* it failed, not just that it did.
+#[derive(Debug)]
+pub struct BuildError {
+    pub message: String,
+    pub sources: Vec<SourceFile>,
+    pub diagnostics: Vec<BuildDiagnostic>,
+}
+
+impl BuildError {
+    fn bare(message: String) -> Self {
+        Self {
+            message,
+            sources: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    pub fn errors(&self) -> impl Iterator<Item = &BuildDiagnostic> {
+        self.diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+    }
+}
+
+impl std::fmt::Display for BuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for BuildError {}
+
+/// Progress events, emitted as the build proceeds so long builds can report
+/// liveness. Purely informational — everything durable is in [`BuildReport`].
+#[derive(Debug)]
+pub enum Progress<'a> {
+    FileParsed {
+        path: &'a str,
+        definitions: usize,
+    },
+    CompileStarted,
+    Lowering {
+        label: &'static str,
+        named: usize,
+    },
+    BinFinished(&'a BinSummary),
+}
+
+/// Compile the text def corpus under `input` into the four binaries in
+/// `output`, creating `output` if needed.
+///
+/// `input` is the `Defs/` directory: `.def`/`.tpl` sources plus the `.h` header
+/// files they draw symbols from, scanned recursively.  `output` receives
+/// `game.bin`, `frontend.bin`, `script.bin`, and `names.bin`.
+pub fn build(input: &Path, output: &Path) -> Result<BuildReport, BuildError> {
+    build_with_progress(input, output, &mut |_| {})
+}
+
+/// [`build`], plus a callback invoked as the build proceeds.
+pub fn build_with_progress(
+    input: &Path,
+    output: &Path,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<BuildReport, BuildError> {
+    // Without this check a wrong input path is not an error: the directory walks
+    // yield nothing, and the build cheerfully emits NULLDEF-only binaries that
+    // look valid and load into a broken game.
+    if !input.is_dir() {
+        return Err(BuildError::bare(format!(
+            "input is not a directory: {}",
+            input.display()
+        )));
+    }
+    std::fs::create_dir_all(output)
+        .map_err(|e| BuildError::bare(format!("create out dir: {e}")))?;
+
+    let started = Instant::now();
+    let diagnostics = Diagnostics::default();
+
+    let corpus = match parse_corpus(input, &diagnostics, on_progress) {
+        Ok(c) => c,
+        Err(message) => {
+            return Err(BuildError {
+                message,
+                sources: Vec::new(),
+                diagnostics: diagnostics.take(),
+            });
+        }
+    };
+
+    // From here on any failure can still point at source, so hand the caller
+    // the sources and everything collected so far.
+    let finish = |message: String, sources: Vec<SourceFile>, diagnostics: &Diagnostics| BuildError {
+        message,
+        sources,
+        diagnostics: diagnostics.take(),
+    };
+
+    // A parse error is fatal for its file — every def in it is dropped. Letting
+    // the build succeed anyway means silently emitting binaries that are missing
+    // defs, which is exactly the failure the diagnostics exist to prevent.
+    let parse_failures = diagnostics.count(Severity::Error);
+    if parse_failures > 0 {
+        return Err(finish(
+            format!("{parse_failures} file(s) failed to parse"),
+            corpus.sources,
+            &diagnostics,
+        ));
+    }
+
+    on_progress(Progress::CompileStarted);
+    let names_cell = RefCell::new(NamesBuilder::new());
+    let mut bins = Vec::with_capacity(3);
+    for config in [&GAME_CONFIG, &FRONTEND_CONFIG, &SCRIPT_CONFIG] {
+        match build_one_bin(&corpus, config, &diagnostics, &names_cell, output, on_progress) {
+            Ok(summary) => {
+                on_progress(Progress::BinFinished(&summary));
+                bins.push(summary);
+            }
+            Err(message) => return Err(finish(message, corpus.sources, &diagnostics)),
+        }
+    }
+
+    let names = names_cell.into_inner().finalize(manifest::NAMES_HEADER_BYTES);
+    if let Err(e) = std::fs::write(output.join("names.bin"), names.to_bytes()) {
+        return Err(finish(
+            format!("write names.bin: {e}"),
+            corpus.sources,
+            &diagnostics,
+        ));
+    }
+
+    Ok(BuildReport {
+        sources: corpus.sources,
+        diagnostics: diagnostics.take(),
+        bins,
+        elapsed: started.elapsed(),
+    })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Internal plumbing
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Interior-mutable diagnostic sink, so the collection points can sit behind
+/// the shared `&BuildCtx` borrows the pipeline is built on.
+#[derive(Default)]
+struct Diagnostics(RefCell<Vec<BuildDiagnostic>>);
+
+impl Diagnostics {
+    fn push(&self, diag: BuildDiagnostic) {
+        self.0.borrow_mut().push(diag);
+    }
+
+    fn take(&self) -> Vec<BuildDiagnostic> {
+        self.0.borrow_mut().split_off(0)
+    }
+
+    fn count(&self, severity: Severity) -> usize {
+        self.0
+            .borrow()
+            .iter()
+            .filter(|d| d.severity == severity)
+            .count()
+    }
+}
+
+/// Normalize `\` to `/` so path matching and reported paths are the same on
+/// every platform. The scoping rules below match on `/`-separated fragments.
+fn normalize_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 /// Recursively walk all statements/expressions in every definition's body
@@ -121,22 +375,25 @@ struct BuildCtx<'a> {
     symbols: &'a SymbolTable,
     def_indices: &'a HashMap<String, u32>,
     names: &'a RefCell<NamesBuilder>,
-    code_files: &'a SimpleFiles<String, String>,
-    def_to_file_id: &'a HashMap<String, usize>,
+    sources: &'a [SourceFile],
+    def_to_source: &'a HashMap<String, usize>,
     def_spans: &'a HashMap<String, Span>,
     defs_by_name: &'a HashMap<&'a str, &'a Definition>,
     nulldefs: &'a HashMap<String, DefBody>,
+    diagnostics: &'a Diagnostics,
 }
+
 struct ParsedCorpus {
     /// Parsed def files with their disk paths (for per-binary scoping).
     files: Vec<ParsedFile>,
     symbols: SymbolTable,
-    code_files: SimpleFiles<String, String>,
-    def_to_file_id: HashMap<String, usize>,
+    sources: Vec<SourceFile>,
+    def_to_source: HashMap<String, usize>,
     def_spans: HashMap<String, Span>,
 }
 
 struct ParsedFile {
+    /// Normalized (`/`-separated) path; also the `sources` entry's path.
     path: String,
     def_file: DefFile,
 }
@@ -166,333 +423,60 @@ struct Built {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  Config constants
+//  Per-binary file scoping
 // ═══════════════════════════════════════════════════════════════════════════════
-
-/// Files that constitute the frontend corpus (relative to Defs/, forward slashes).
-const FRONTEND_DEF_FILES: &[&str] = &[
-    "ui_dialogs.def",
-    "FrontEndDefs/engine.def",
-    "FrontEndDefs/engine_video_options.def",
-    "FrontEndDefs/front_end.def",
-    "FrontEndDefs/frontend_test.def",
-    "FrontEndDefs/pc_frontend.def",
-    "config_options_defaults.def",
-    "controls.def",
-    "pc_controls.def",
-];
 
 fn game_file_scope(corpus: &[ParsedFile]) -> Vec<&ParsedFile> {
     corpus.iter().collect()
 }
 
+/// Retail's explicit frontend file list first, in its own order, then any other
+/// file under `FrontEndDefs/` in walk order. The tail is what lets defs added
+/// by an editor (which writes to its own file in that directory) reach
+/// frontend.bin; the retail corpus has no such files, so ordering there is
+/// unchanged.
 fn frontend_file_scope(corpus: &[ParsedFile]) -> Vec<&ParsedFile> {
-    FRONTEND_DEF_FILES
+    let mut scoped: Vec<&ParsedFile> = manifest::FRONTEND_DEF_FILES
         .iter()
-        .filter_map(|rel| corpus.iter().find(|pf| pf.path.ends_with(rel)))
-        .collect()
+        .filter_map(|rel| corpus.iter().find(|pf| path_ends_with(&pf.path, rel)))
+        .collect();
+    for pf in corpus {
+        if pf.path.contains("/FrontEndDefs/")
+            && !scoped.iter().any(|s| std::ptr::eq(*s, pf))
+        {
+            scoped.push(pf);
+        }
+    }
+    scoped
 }
 
 fn script_file_scope(corpus: &[ParsedFile]) -> Vec<&ParsedFile> {
     corpus
         .iter()
-        .filter(|pf| pf.path.contains("ScriptDefs/") || pf.path.contains("ScriptDefs\\"))
+        .filter(|pf| pf.path.contains("ScriptDefs/"))
         .collect()
 }
 
-const GAME_HEADER: DefBinaryHeader = DefBinaryHeader {
-    use_names_bin: false,
-    file_indicator: 0xC69C21A6,
-    platform_indicator: 0xA8E36C34,
-    entry_count: 0,
-};
-const FRONTEND_HEADER: DefBinaryHeader = DefBinaryHeader {
-    use_names_bin: false,
-    file_indicator: 0xE86E4CDE,
-    platform_indicator: 0xA8E36C34,
-    entry_count: 0,
-};
-const SCRIPT_HEADER: DefBinaryHeader = DefBinaryHeader {
-    use_names_bin: false,
-    file_indicator: 0x35A0BC99,
-    platform_indicator: 0xA8E36C34,
-    entry_count: 0,
-};
-const NAMES_HEADER_BYTES: [u8; 20] = [
-    0x1E, 0xAB, 0x07, 0x00, 0x34, 0x6C, 0xE3, 0xA8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00,
-];
-
-const GAME_NULLDEF_ENTRIES: &[&str] = &[
-    "ARMOUR",
-    "ATTACK_PATTERN",
-    "BRAIN",
-    "BUILDING",
-    "CAICreatureWillPowerIndicatorDef",
-    "CAIScratchpadDef",
-    "CAMERA_MANAGER",
-    "CAMERA_MANAGER_SET",
-    "CAMERA_MODE",
-    "CARRY_SLOT",
-    "CAbilityDef",
-    "CActionUseDef",
-    "CActivateQuestDef",
-    "CAnimatingObjectDef",
-    "CAppearanceDef",
-    "CAppearanceModifierDef",
-    "CAreaOfEffectAttackDef",
-    "CAugmentationDef",
-    "CBalverineBattleDef",
-    "CBedDef",
-    "CBettingDef",
-    "CBoastingPodiumDef",
-    "CBonusItemDef",
-    "CBossDef",
-    "CBriarRoseDef",
-    "CBuyHouseDef",
-    "CBuyableHouseDef",
-    "CCameraCollisionDef",
-    "CCarriedReadableDef",
-    "CCarryableDef",
-    "CCarryingDef",
-    "CChestDef",
-    "CClockDef",
-    "CCoinGameObstacleDef",
-    "CCombatAbilityBlockCounterAttackDef",
-    "CCombatAbilityBlockHeavyWeaponAttackDef",
-    "CCombatAbilityBlockLightWeaponAttackDef",
-    "CCombatAbilityBlockProjectileWeaponAttackDef",
-    "CCombatAbilityBlockUnarmedAttackDef",
-    "CCombatAbilityFlourishCounterAttackDef",
-    "CCombatAbilityGetHitCounterAttackDef",
-    "CCombatAbilityStrafeDef",
-    "CCombatAbilityUseProjectileWeaponDef",
-    "CContainerRewardHeroDef",
-    "CContextSensitiveItemDef",
-    "CCoopSpiritDef",
-    "CCrateStackDef",
-    "CCreatureDef",
-    "CCreatureGeneratorDef",
-    "CCreatureModeDef",
-    "CCreatureNavigationDef",
-    "CCreatureStatsDef",
-    "CDecapitationDef",
-    "CDegradableDef",
-    "CDoorDef",
-    "CDragonActionHoverDef",
-    "CDragonActionNapalmDef",
-    "CDragonActionSwoopDef",
-    "CDrunkennessDef",
-    "CEnemyDef",
-    "CEntitySoundDef",
-    "CExperienceDef",
-    "CExplodingObjectDef",
-    "CExplosionDef",
-    "CExplosiveTrailDef",
-    "CExpressionSubDef",
-    "CFireballSpellLevelDef",
-    "CFireheartMinigameDef",
-    "CFishDef",
-    "CFishingDef",
-    "CFishingRodDef",
-    "CFlammableDef",
-    "CGiftDef",
-    "CGoldDef",
-    "CGuardDef",
-    "CGuildMasterDef",
-    "CHairCardDef",
-    "CHasNameDef",
-    "CHeroCentreDef",
-    "CHeroDef",
-    "CHeroExperienceDef",
-    "CHeroMarriageDef",
-    "CHeroMorphDef",
-    "CHeroPostcardGeneratorDef",
-    "CHeroSpecialMovementDef",
-    "CHeroSuitDef",
-    "CHeroTitleDef",
-    "CHighlightItemDef",
-    "CHitLocationsDef",
-    "CIdleSchedulerDef",
-    "CInterestingToVillagersDef",
-    "CInventoryItemDef",
-    "CJackDragonDef",
-    "CJackOfBladesBattleDef",
-    "CKickableDef",
-    "CKrakenDef",
-    "CKrakenTentacleDef",
-    "CLightDef",
-    "CLightningOrbDef",
-    "CLookDef",
-    "CMazeBattleDef",
-    "CMultiStaticMeshDef",
-    "CNymphDef",
-    "COMBAT_DIALOGUE_DEF",
-    "COMBAT_SEQUENCE",
-    "COMBAT_TYPE",
-    "CONFIG_OPTIONS_DEFAULTS_DEF",
-    "CONTROL_SCHEME",
-    "CObjectAugmentationsDef",
-    "COccupiableDef",
-    "COpinionOfHeroDef",
-    "COracleMinigameDef",
-    "COverheadDisplayDef",
-    "CParticleAttacherDef",
-    "CPerceivedThingDef",
-    "CPhysicsDef",
-    "CQuestCardDef",
-    "CREATURE",
-    "CREATURE_ABILITY",
-    "CREATURE_GENERATION_FAMILY",
-    "CReadableDef",
-    "CReplaceableMeshDef",
-    "CResurrectionItemDef",
-    "CRumbleDef",
-    "CScorpionKingBattleDef",
-    "CShipDef",
-    "CShopDef",
-    "CShopItemDef",
-    "CSkeletalMorphDef",
-    "CSmashableDef",
-    "CSmokeGeneratorDef",
-    "CSnowTrollDef",
-    "CSoundAtmospheresDef",
-    "CSpecialAbilitiesDrainLifeDataDef",
-    "CSpecialAbilitiesForcePushDataDef",
-    "CSpecialEffectsDef",
-    "CSpotLightDef",
-    "CStealthDef",
-    "CStockItemDef",
-    "CSummonDef",
-    "CSummonableCreatureDef",
-    "CSummonerDef",
-    "CTCVolumeContainmentTrackerDef",
-    "CTargetingDef",
-    "CTattooDef",
-    "CTavernDef",
-    "CTavernGameCardBaseDef",
-    "CTavernGameCoinBaseDef",
-    "CTavernGameCoinGolfDef",
-    "CTavernGameDef",
-    "CTavernGameShoveHaPennyDef",
-    "CTavernGameSpotTheAdditionDef",
-    "CTavernTableDef",
-    "CTeleporterDef",
-    "CTextureReplacementDef",
-    "CThingDrainLifeShotDef",
-    "CThingMultiArrowShotDef",
-    "CThunderBattleDef",
-    "CTimeAppearanceFadeDef",
-    "CTrapDef",
-    "CTrollBattleDef",
-    "CTrophyDef",
-    "CTurncoatDef",
-    "CVillageDef",
-    "CVillageMemberDef",
-    "CVillagePeopleDef",
-    "CWallMountEffectsDef",
-    "CWaspQueenBattleDef",
-    "CWeaponDef",
-    "CWhisperBattleDef",
-    "CWifeDef",
-    "CWillResponseDef",
-    "ENGINE",
-    "ENGINE_THEME",
-    "ENGINE_THEME_GROUP",
-    "ENGINE_VIDEO_OPTIONS",
-    "ENVIRONMENT",
-    "ENVIRONMENT_THEME_DAY",
-    "EXPRESSION",
-    "FACTION",
-    "GLOBAL",
-    "HERO_ABILITY",
-    "HERO_COMBAT",
-    "HERO_MELEE_COMBAT_ABILITY",
-    "HERO_STATS",
-    "HIT_LOCATION",
-    "HOLY_SITE",
-    "INVENTORY_CATEGORY",
-    "INVENTORY_ITEM",
-    "INVENTORY_TYPE",
-    "LIGHTNING",
-    "LOCAL_DETAIL_GENERATOR",
-    "MARKER",
-    "MATERIAL",
-    "MELEE_COMBAT_KNOCKDOWN_EFFECTS",
-    "MESSAGE_EVENT",
-    "NOISE",
-    "OBJECT",
-    "OBJECT_FAMILY",
-    "OPINION_DEED_EFFECTS",
-    "OPINION_DEED_MASK",
-    "OPINION_PERSONALITY",
-    "OPINION_REACTION_MANAGER",
-    "OPINION_REACTION_MASK",
-    "OPINION_SOURCE",
-    "PHYSICAL_SWITCH",
-    "PLAYER",
-    "PLAYER_GUI",
-    "PLAYER_INVENTORY",
-    "PLAYER_MOVEMENT",
-    "REGION",
-    "SHOT",
-    "SIM_BUILDING",
-    "SIM_VOICES",
-    "SKY",
-    "SOUND_SETUP",
-    "SOUND_THEME",
-    "SPECIAL_ABILITIES_ASSASSIN_RUSH_DEF",
-    "SPECIAL_ABILITIES_BATTLE_CHARGE_DEF",
-    "SPECIAL_ABILITIES_BERSERK_DEF",
-    "SPECIAL_ABILITIES_BULLET_TIME_DEF",
-    "SPECIAL_ABILITIES_BURNT_EFFECT_DEF",
-    "SPECIAL_ABILITIES_CREATURE_TINT_DEF",
-    "SPECIAL_ABILITIES_DIVINE_WRATH_DEF",
-    "SPECIAL_ABILITIES_DRAIN_LIFE_DEF",
-    "SPECIAL_ABILITIES_DRUNKENNESS_DEF",
-    "SPECIAL_ABILITIES_ELECTROCUTED_EFFECT_DEF",
-    "SPECIAL_ABILITIES_ENFLAME_DEF",
-    "SPECIAL_ABILITIES_FIREBALL_SPELL_DEF",
-    "SPECIAL_ABILITIES_FORCE_PUSH_DEF",
-    "SPECIAL_ABILITIES_GHOST_SWORD_DEF",
-    "SPECIAL_ABILITIES_HEAL_LIFE_DEF",
-    "SPECIAL_ABILITIES_LIGHTNING_SPELL_DEF",
-    "SPECIAL_ABILITIES_MULTI_ARROW_DEF",
-    "SPECIAL_ABILITIES_MULTI_STRIKE_DEF",
-    "SPECIAL_ABILITIES_PHYSICAL_SHIELD_DEF",
-    "SPECIAL_ABILITIES_SUMMON_SPELL_DEF",
-    "SPECIAL_ABILITIES_THUNDER_LIGHTNING_STORM_DEF",
-    "SPECIAL_ABILITIES_TURNCOAT_SPELL_DEF",
-    "SPECIAL_ABILITIES_UNHOLY_POWER_DEF",
-    "SWITCH",
-    "THING",
-    "THING_GROUP",
-    "UI",
-    "UI_ICONS_DEF",
-    "UI_LOCALE_GRAPHICS_DEF",
-    "UI_MISC_THINGS_DEF",
-    "VILLAGE",
-    "VILLAGER_INTERACTION",
-];
-
-const FRONTEND_NULLDEF_ENTRIES: &[&str] = &[
-    "CONFIG_OPTIONS_DEFAULTS_DEF",
-    "CONTROL_SCHEME",
-    "CONTROL_SCHEME",
-    "ENGINE",
-    "ENGINE_VIDEO_OPTIONS",
-    "FRONT_END",
-    "UI",
-    "UI_ICONS_DEF",
-    "UI_MISC_THINGS_DEF",
-];
-
-const SCRIPT_NULLDEF_ENTRIES: &[&str] = &["CCutsceneDef", "CRegionScriptDef", "CScriptDef"];
+/// Whether a normalized path ends with a normalized relative path, **at a path
+/// boundary**.
+///
+/// The boundary matters: the corpus has both `Defs/controls.def` and
+/// `Defs/pc_controls.def`, and both `Defs/engine.def` and
+/// `Defs/FrontEndDefs/engine.def`. A bare `str::ends_with` matches the wrong one
+/// of each pair, and only picks the right file because the sorted walk order
+/// happens to reach it first.
+fn path_ends_with(path: &str, rel: &str) -> bool {
+    match path.strip_suffix(rel) {
+        Some("") => true,
+        Some(prefix) => prefix.ends_with('/'),
+        None => false,
+    }
+}
 
 static GAME_CONFIG: BinConfig = BinConfig {
     label: "game",
-    nulldef_entries: GAME_NULLDEF_ENTRIES,
-    binary_header: GAME_HEADER,
+    nulldef_entries: manifest::GAME_NULLDEF_ENTRIES,
+    binary_header: manifest::GAME_HEADER,
     out_filename: "game.bin",
     has_subdefs: true,
     filter_templates: false,
@@ -501,8 +485,8 @@ static GAME_CONFIG: BinConfig = BinConfig {
 
 static FRONTEND_CONFIG: BinConfig = BinConfig {
     label: "frontend",
-    nulldef_entries: FRONTEND_NULLDEF_ENTRIES,
-    binary_header: FRONTEND_HEADER,
+    nulldef_entries: manifest::FRONTEND_NULLDEF_ENTRIES,
+    binary_header: manifest::FRONTEND_HEADER,
     out_filename: "frontend.bin",
     has_subdefs: false,
     filter_templates: false,
@@ -511,8 +495,8 @@ static FRONTEND_CONFIG: BinConfig = BinConfig {
 
 static SCRIPT_CONFIG: BinConfig = BinConfig {
     label: "script",
-    nulldef_entries: SCRIPT_NULLDEF_ENTRIES,
-    binary_header: SCRIPT_HEADER,
+    nulldef_entries: manifest::SCRIPT_NULLDEF_ENTRIES,
+    binary_header: manifest::SCRIPT_HEADER,
     out_filename: "script.bin",
     has_subdefs: false,
     filter_templates: false,
@@ -532,8 +516,8 @@ fn collect_h_files(dir: &Path, out: &mut Vec<PathBuf>) {
         if path.is_dir() {
             collect_h_files(&path, out);
         } else if matches!(path.extension().and_then(|e| e.to_str()), Some("h")) {
-            let s = path.to_string_lossy();
-            if s.contains("xbox/") || s.contains("scriptdialoguesnds2") {
+            let s = normalize_path(&path);
+            if s.contains("/xbox/") || s.contains("scriptdialoguesnds2") {
                 continue;
             }
             out.push(path);
@@ -541,25 +525,35 @@ fn collect_h_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn load_symbols(source: &Path) -> SymbolTable {
+fn load_symbols(source: &Path, diagnostics: &Diagnostics) -> SymbolTable {
     let mut symbols = SymbolTable::new();
     let mut h_files = Vec::new();
     collect_h_files(source, &mut h_files);
     h_files.sort();
     for path in &h_files {
+        let display = normalize_path(path);
         match std::fs::read_to_string(path) {
             Ok(t) => match parse_header_file(&t) {
                 Ok(hd) => {
                     if let Err(e) = symbols.evaluate(&hd) {
-                        eprintln!("warning: header {}: evaluate error: {e:?}", path.display());
+                        diagnostics.push(BuildDiagnostic::bare(
+                            Severity::Warning,
+                            format!("header {display}: evaluate error: {e:?}"),
+                        ));
                     }
                 }
                 Err(e) => {
-                    eprintln!("warning: header {}: parse error: {e}", path.display());
+                    diagnostics.push(BuildDiagnostic::bare(
+                        Severity::Warning,
+                        format!("header {display}: parse error: {e}"),
+                    ));
                 }
             },
             Err(e) => {
-                eprintln!("warning: header {}: read error: {e}", path.display());
+                diagnostics.push(BuildDiagnostic::bare(
+                    Severity::Warning,
+                    format!("header {display}: read error: {e}"),
+                ));
             }
         }
     }
@@ -586,15 +580,19 @@ fn inject_engine_enums(symbols: &mut SymbolTable) {
 
 /// Parse every `.def` and `.tpl` file under `source`, loading all header
 /// symbols.  Returns a [`ParsedCorpus`] that all three binary builders share.
-fn parse_corpus(source: &Path) -> Result<ParsedCorpus, String> {
-    let mut symbols = load_symbols(source);
+fn parse_corpus(
+    source: &Path,
+    diagnostics: &Diagnostics,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<ParsedCorpus, String> {
+    let mut symbols = load_symbols(source, diagnostics);
     inject_engine_enums(&mut symbols);
 
-    let mut code_files: SimpleFiles<String, String> = SimpleFiles::new();
-    let mut def_to_file_id: HashMap<String, usize> = HashMap::new();
+    let mut sources: Vec<SourceFile> = Vec::new();
+    let mut def_to_source: HashMap<String, usize> = HashMap::new();
     let mut def_spans: HashMap<String, Span> = HashMap::new();
     let mut parsed_files: Vec<ParsedFile> = Vec::new();
-    let mut file_ids: Vec<usize> = Vec::new();
+    let mut source_ids: Vec<usize> = Vec::new();
 
     for p in &walk_def_files(source) {
         if p.file_name()
@@ -605,122 +603,184 @@ fn parse_corpus(source: &Path) -> Result<ParsedCorpus, String> {
         }
         let raw = std::fs::read(p).map_err(|e| format!("read {p:?}: {e}"))?;
         let text = String::from_utf8_lossy(&raw).into_owned();
-        let path_str = p.to_string_lossy().to_string();
+        let path = normalize_path(p);
         match parse_def_file(&text) {
             Ok(f) => {
                 let def_count = f.definitions.len();
-                let fid = code_files.add(path_str.clone(), text);
-                file_ids.push(fid);
+                let sid = sources.len();
+                sources.push(SourceFile {
+                    path: path.clone(),
+                    text,
+                });
+                source_ids.push(sid);
                 for d in &f.definitions {
-                    def_to_file_id.insert(d.value.name.clone(), fid);
+                    def_to_source.insert(d.value.name.clone(), sid);
                     def_spans.insert(d.value.name.clone(), d.span);
                 }
+                on_progress(Progress::FileParsed {
+                    path: &path,
+                    definitions: def_count,
+                });
                 parsed_files.push(ParsedFile {
-                    path: path_str,
+                    path,
                     def_file: f,
                 });
-                eprintln!("    {} ({} definitions)", p.display(), def_count);
             }
             Err(e) => {
-                let fid = code_files.add(path_str, text);
-                render_parse_error(&code_files, fid, &e);
+                let sid = sources.len();
+                sources.push(SourceFile { path, text });
+                diagnostics.push(parse_error_diagnostic(&sources, sid, &e));
             }
         }
     }
 
-    for (&file_id, pf) in file_ids.iter().zip(parsed_files.iter()) {
+    // An input directory that exists but holds no def sources would otherwise
+    // produce NULLDEF-only binaries with no indication anything was wrong.
+    //
+    // Test `sources`, not `parsed_files`: a file that fails to parse is still
+    // registered as a source, so this stays "found nothing to compile" and does
+    // not swallow the "everything failed to parse" case, whose diagnostics are
+    // far more useful to the caller.
+    if sources.is_empty() {
+        return Err(format!(
+            "no .def or .tpl files found under {}",
+            source.display()
+        ));
+    }
+
+    for (&sid, pf) in source_ids.iter().zip(parsed_files.iter()) {
         if let Err(e) = symbols.evaluate_items(&pf.def_file.headers) {
-            let diag = Diagnostic::warning()
-                .with_message(format!("header evaluation failed: {e:?}"))
-                .with_labels(vec![
-                    Label::secondary(file_id, 0..0).with_message("in this file"),
-                ]);
-            emit_diagnostic(&code_files, &diag);
+            diagnostics.push(BuildDiagnostic {
+                severity: Severity::Warning,
+                message: format!("header evaluation failed: {e:?}"),
+                source: Some(sid),
+                labels: vec![DiagnosticLabel {
+                    primary: false,
+                    span: Span { start: 0, end: 0 },
+                    message: Some("in this file".to_string()),
+                }],
+            });
         }
     }
 
     Ok(ParsedCorpus {
         files: parsed_files,
         symbols,
-        code_files,
-        def_to_file_id,
+        sources,
+        def_to_source,
         def_spans,
     })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  Shared helper functions
+//  Diagnostic construction
 // ═══════════════════════════════════════════════════════════════════════════════
 
 fn def_header_end(text: &str, start: usize) -> usize {
     text[start..].find('\n').map_or(text.len(), |n| start + n)
 }
 
-fn render_parse_error(files: &SimpleFiles<String, String>, file_id: usize, error: &DefParseError) {
-    let Ok(source) = files.source(file_id) else {
-        return;
-    };
+/// A parse error is strict and fatal for its file, so the whole file's defs
+/// vanish — it must always be surfaced. `MissingEndDefinition` points at the
+/// unclosed definition; anything else gets a caret at the offending byte plus
+/// an "in this definition" note.
+fn parse_error_diagnostic(
+    sources: &[SourceFile],
+    source: usize,
+    error: &DefParseError,
+) -> BuildDiagnostic {
     let msg = format!("{error}");
+    let text = &sources[source].text;
     let mut labels = Vec::new();
     match (&error.inner, error.def_header_pos) {
         (TextParseErrorKind::MissingEndDefinition, Some(def_pos)) => {
-            let def_end = def_header_end(source, def_pos);
-            labels.push(
-                Label::primary(file_id, def_pos..def_end)
-                    .with_message("missing #end_definition for this definition"),
-            );
+            labels.push(DiagnosticLabel {
+                primary: true,
+                span: Span {
+                    start: def_pos,
+                    end: def_header_end(text, def_pos),
+                },
+                message: Some("missing #end_definition for this definition".to_string()),
+            });
         }
         (_, def_header) => {
-            labels.push(Label::primary(file_id, error.pos..error.pos).with_message(msg.clone()));
+            labels.push(DiagnosticLabel {
+                primary: true,
+                span: Span {
+                    start: error.pos,
+                    end: error.pos,
+                },
+                message: Some(msg.clone()),
+            });
             if let Some(def_pos) = def_header {
-                let def_end = def_header_end(source, def_pos);
-                labels.push(
-                    Label::secondary(file_id, def_pos..def_end).with_message("in this definition"),
-                );
+                labels.push(DiagnosticLabel {
+                    primary: false,
+                    span: Span {
+                        start: def_pos,
+                        end: def_header_end(text, def_pos),
+                    },
+                    message: Some("in this definition".to_string()),
+                });
             }
         }
     }
-    let diag = Diagnostic::error().with_message(msg).with_labels(labels);
-    emit_diagnostic(files, &diag);
+    BuildDiagnostic {
+        severity: Severity::Error,
+        message: msg,
+        source: Some(source),
+        labels,
+    }
 }
 
-fn render_lowering_error(
+fn lowering_error_diagnostic(
     def_name: &str,
     def_type: &str,
     error: &LowerError,
-    file_id: Option<usize>,
-    def_span: Option<&Span>,
-    files: &SimpleFiles<String, String>,
-) {
-    let Some(fid) = file_id else {
-        eprintln!("error: {def_type} {def_name}: {error}");
-        return;
+    ctx: &BuildCtx,
+) -> BuildDiagnostic {
+    let source = ctx.def_to_source.get(def_name).copied();
+    let Some(sid) = source else {
+        return BuildDiagnostic::bare(
+            Severity::Error,
+            format!("{def_type} {def_name}: {error}"),
+        );
     };
-    let Ok(text) = files.source(fid) else {
-        eprintln!("error: {def_type} {def_name}: {error}");
-        return;
-    };
-    let expr_span = error.primary_span();
+    let text = &ctx.sources[sid].text;
     let mut labels = Vec::new();
-    if let Some(span) = expr_span {
-        labels.push(Label::primary(fid, span.start..span.end).with_message(format!("{error}")));
+    if let Some(span) = error.primary_span() {
+        labels.push(DiagnosticLabel {
+            primary: true,
+            span,
+            message: Some(format!("{error}")),
+        });
     }
-    if let Some(dspan) = def_span {
-        let header_end = def_header_end(text, dspan.start);
-        let header_line = &text[dspan.start..header_end];
+    // Point the "in this definition" note at the name in the header line, not
+    // the whole line, so the caret lands on what identifies the def.
+    if let Some(dspan) = ctx.def_spans.get(def_name) {
+        let header_line = &text[dspan.start..def_header_end(text, dspan.start)];
         if let Some(name_pos) = header_line.find(def_name) {
-            let name_start = dspan.start + name_pos;
-            let name_end = name_start + def_name.len();
-            labels.push(
-                Label::secondary(fid, name_start..name_end).with_message("in this definition"),
-            );
+            let start = dspan.start + name_pos;
+            labels.push(DiagnosticLabel {
+                primary: false,
+                span: Span {
+                    start,
+                    end: start + def_name.len(),
+                },
+                message: Some("in this definition".to_string()),
+            });
         }
     }
-    let diag = Diagnostic::error()
-        .with_message(format!("{error}"))
-        .with_labels(labels);
-    emit_diagnostic(files, &diag);
+    BuildDiagnostic {
+        severity: Severity::Error,
+        message: format!("{error}"),
+        source,
+        labels,
+    }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Shared helper functions
+// ═══════════════════════════════════════════════════════════════════════════════
 
 /// Assign our own global indices to the named region: the first named entry
 /// follows the `nulldef_count` NULLDEF entries, then one index per distinct
@@ -763,17 +823,19 @@ fn build_nulldefs(
     symbols: &SymbolTable,
     def_indices: &HashMap<String, u32>,
     names: &RefCell<NamesBuilder>,
-) -> HashMap<String, DefBody> {
+) -> Result<HashMap<String, DefBody>, String> {
     let mut map: HashMap<String, DefBody> = HashMap::new();
     for &dn in classes {
         if map.contains_key(dn) {
             continue;
         }
+        // A NULLDEF body is `def_default()` with no statements applied, so this
+        // can only fail if the type is missing from the schema entirely.
         let (body, _warnings) = lower_def(dn, None, &[], symbols, def_indices, names)
-            .expect("NULLDEF lowering should never fail");
+            .map_err(|e| format!("NULLDEF lowering failed for {dn}: {e}"))?;
         map.insert(dn.to_string(), body);
     }
-    map
+    Ok(map)
 }
 
 fn emit_nulldef_and_named(
@@ -788,7 +850,7 @@ fn emit_nulldef_and_named(
         let body = ctx
             .nulldefs
             .get(class_name)
-            .expect("NULLDEF body should be pre-built")
+            .ok_or_else(|| format!("NULLDEF body missing for {class_name}"))?
             .clone();
         let cc = nulldef_counter.entry(class_name.to_string()).or_insert(0);
         *cc += 1;
@@ -817,7 +879,10 @@ fn emit_nulldef_and_named(
     let mut error_count = 0;
     for name in named_order {
         let Some(def) = ctx.defs_by_name.get(name.as_str()) else {
-            eprintln!("error: definition {name} not found in parsed corpus");
+            ctx.diagnostics.push(BuildDiagnostic::bare(
+                Severity::Error,
+                format!("definition {name} not found in parsed corpus"),
+            ));
             error_count += 1;
             continue;
         };
@@ -828,21 +893,12 @@ fn emit_nulldef_and_named(
         let body = match flatten_specialization(def, ctx.defs_by_name) {
             Ok(b) => b,
             Err(e) => {
-                render_lowering_error(
-                    name,
-                    &def_type,
-                    &e,
-                    ctx.def_to_file_id.get(name.as_str()).copied(),
-                    ctx.def_spans.get(name.as_str()),
-                    ctx.code_files,
-                );
+                ctx.diagnostics
+                    .push(lowering_error_diagnostic(name, &def_type, &e, ctx));
                 error_count += 1;
                 continue;
             }
         };
-
-        let fid = ctx.def_to_file_id.get(name.as_str()).copied();
-        let dspan = ctx.def_spans.get(name.as_str());
 
         let (lowered, _warnings) = match lower_def(
             &def_type,
@@ -857,7 +913,8 @@ fn emit_nulldef_and_named(
                 b
             }
             Err(e) => {
-                render_lowering_error(name, &def_type, &e, fid, dspan, ctx.code_files);
+                ctx.diagnostics
+                    .push(lowering_error_diagnostic(name, &def_type, &e, ctx));
                 error_count += 1;
                 continue;
             }
@@ -975,12 +1032,12 @@ fn assemble_and_write(
 /// Build the anonymous sub-def region (game.bin only).  Merges same-tag tagged
 /// blocks across the specialization chain, lowers each sub-def, deduplicates
 /// anonymous entries by (class-tag, bytes), and appends them to `entries`.
-fn build_subdefs<'a>(
+fn build_subdefs(
     named_order: &[String],
     named_base: usize,
-    ctx: &BuildCtx<'a>,
+    ctx: &BuildCtx,
     entries: &mut Vec<Built>,
-) -> Result<(usize, usize, usize), String> {
+) -> Result<(usize, usize), String> {
     let mut sub_dedup: HashMap<(String, Vec<u8>), u32> = HashMap::new();
     let mut sub_entries: Vec<Built> = Vec::new();
     let mut sub_counter: HashMap<String, u32> = HashMap::new();
@@ -1026,14 +1083,12 @@ fn build_subdefs<'a>(
                     b
                 }
                 Err(e) => {
-                    if let Some(&fid) = ctx.def_to_file_id.get(name.as_str()) {
-                        let diag = Diagnostic::error()
-                            .with_message(format!("sub-def lowering failed for <{tag}> in {name}"))
-                            .with_labels(vec![
-                                Label::secondary(fid, 0..0).with_message(format!("{e}")),
-                            ]);
-                        emit_diagnostic(ctx.code_files, &diag);
-                    }
+                    ctx.diagnostics.push(BuildDiagnostic {
+                        severity: Severity::Error,
+                        message: format!("sub-def lowering failed for <{tag}> in {name}: {e}"),
+                        source: ctx.def_to_source.get(name.as_str()).copied(),
+                        labels: Vec::new(),
+                    });
                     sub_fail += 1;
                     continue;
                 }
@@ -1090,15 +1145,17 @@ fn build_subdefs<'a>(
     }
     let unique = sub_entries.len();
     entries.extend(sub_entries);
-    Ok((sub_ok, sub_fail, unique))
+    Ok((sub_ok, unique))
 }
 
 fn build_one_bin(
     corpus: &ParsedCorpus,
     config: &BinConfig,
+    diagnostics: &Diagnostics,
     names: &RefCell<NamesBuilder>,
     out_dir: &Path,
-) -> Result<u32, String> {
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<BinSummary, String> {
     // Scope the corpus to this binary's file set, preserving the original
     // file-processing order (the game walk order for game.bin, the explicit
     // file-list order for frontend.bin, sorted-directory order for script.bin).
@@ -1131,72 +1188,76 @@ fn build_one_bin(
         &corpus.symbols,
         &named_indices,
         names,
-    );
+    )?;
     let ctx = BuildCtx {
         symbols: &corpus.symbols,
         def_indices: &named_indices,
         names,
-        code_files: &corpus.code_files,
-        def_to_file_id: &corpus.def_to_file_id,
+        sources: &corpus.sources,
+        def_to_source: &corpus.def_to_source,
         def_spans: &corpus.def_spans,
         defs_by_name: &defs_by_name,
         nulldefs: &nulldefs,
+        diagnostics,
     };
 
-    eprintln!("    lowering {} named definitions...", named_order.len());
+    on_progress(Progress::Lowering {
+        label: config.label,
+        named: named_order.len(),
+    });
     let mut entries: Vec<Built> = Vec::new();
-    let n_ok = emit_nulldef_and_named(&mut entries, config.nulldef_entries, &named_order, &ctx)?;
+    let lowered = emit_nulldef_and_named(&mut entries, config.nulldef_entries, &named_order, &ctx)?;
 
     let named_base = nulldef_count as usize;
-    let (sub_ok, sub_fail, unique_subdefs) = if config.has_subdefs {
+    let (sub_defs_lowered, sub_defs_unique) = if config.has_subdefs {
         build_subdefs(&named_order, named_base, &ctx, &mut entries)?
     } else {
-        (0, 0, 0)
+        (0, 0)
     };
 
-    let entry_count = assemble_and_write(
+    let entries = assemble_and_write(
         entries,
         &config.binary_header,
         &out_dir.join(config.out_filename),
         config.label,
     )?;
-    if config.has_subdefs {
-        eprintln!(
-            "  {}: {n_ok} lowered, sub-defs: {sub_ok} ok/{sub_fail} fail/{unique_subdefs} unique, {entry_count} entries",
-            config.label,
-        );
-    } else {
-        eprintln!("  {}: {n_ok} lowered, {entry_count} entries", config.label);
-    }
-    Ok(entry_count)
+    Ok(BinSummary {
+        label: config.label,
+        file_name: config.out_filename,
+        lowered,
+        entries,
+        has_sub_defs: config.has_subdefs,
+        sub_defs_lowered,
+        sub_defs_unique,
+    })
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Top-level entry point
-// ═══════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-pub fn build_all(source: &Path, out_dir: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(out_dir).map_err(|e| format!("create out dir: {e}"))?;
+    #[test]
+    fn path_matching_respects_path_boundaries() {
+        // The two real ambiguities in the corpus.
+        assert!(path_ends_with("x/Defs/controls.def", "controls.def"));
+        assert!(!path_ends_with("x/Defs/pc_controls.def", "controls.def"));
+        assert!(path_ends_with(
+            "x/Defs/FrontEndDefs/engine.def",
+            "FrontEndDefs/engine.def"
+        ));
+        assert!(!path_ends_with("x/Defs/engine.def", "FrontEndDefs/engine.def"));
+        // A bare relative path with no leading directory still matches at root.
+        assert!(path_ends_with("ui_dialogs.def", "ui_dialogs.def"));
+    }
 
-    let started = Instant::now();
-
-    let corpus = parse_corpus(source)?;
-
-    eprintln!("  compiling...");
-    let builder_cell = RefCell::new(NamesBuilder::new());
-    let game_count = build_one_bin(&corpus, &GAME_CONFIG, &builder_cell, out_dir)?;
-    let frontend_count = build_one_bin(&corpus, &FRONTEND_CONFIG, &builder_cell, out_dir)?;
-    let script_count = build_one_bin(&corpus, &SCRIPT_CONFIG, &builder_cell, out_dir)?;
-
-    let names = builder_cell.into_inner().finalize(NAMES_HEADER_BYTES);
-    let names_bytes = names.to_bytes();
-    std::fs::write(out_dir.join("names.bin"), &names_bytes)
-        .map_err(|e| format!("write names.bin: {e}"))?;
-
-    let elapsed = started.elapsed();
-    eprintln!(
-        "  finished in {:.1}s — game.bin: {game_count} entries, frontend.bin: {frontend_count} entries, script.bin: {script_count} entries",
-        elapsed.as_secs_f64()
-    );
-    Ok(())
+    #[test]
+    fn windows_separators_normalize_to_forward_slashes() {
+        let path = normalize_path(Path::new(r"C:\Fable\Data\Defs\FrontEndDefs\engine.def"));
+        assert_eq!(path, "C:/Fable/Data/Defs/FrontEndDefs/engine.def");
+        // The scoping rules are written against `/`, so they now work on paths
+        // that came from a Windows filesystem.
+        assert!(path_ends_with(&path, "FrontEndDefs/engine.def"));
+        assert!(normalize_path(Path::new(r"a\Defs\ScriptDefs\quest.def")).contains("ScriptDefs/"));
+        assert!(normalize_path(Path::new(r"a\DevHeaders\xbox\gfx.h")).contains("/xbox/"));
+    }
 }

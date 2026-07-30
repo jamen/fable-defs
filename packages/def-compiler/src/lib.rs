@@ -1,13 +1,39 @@
-//! Def compilation: text [`Definition`]s → typed binary def structs.
+//! Def compilation: text [`Definition`]s → typed binary def structs → the four
+//! compiled-def binaries.
 //!
 //! Depends on `defs` for the lower-level text parsing/symbol evaluation
 //! and the binary def structs. This crate owns the [`DefReader`] (which scans a
-//! definition body by field name).
+//! definition body by field name), the lowering layer, and the assembly
+//! pipeline.
 //!
-//! [`Definition`]: defs::def::text::Definition
+//! The top-level entry point is [`build`]:
+//!
+//! ```no_run
+//! let report = def_compiler::build(
+//!     std::path::Path::new("Fable/Data/Defs"),
+//!     std::path::Path::new("Fable/Data/CompiledDefs"),
+//! )?;
+//! for warning in report.warnings() {
+//!     eprintln!("{}", warning.message);
+//! }
+//! # Ok::<_, def_compiler::BuildError>(())
+//! ```
+//!
+//! Diagnostics are returned, not printed — see [`BuildReport`]. Rendering them
+//! (with source excerpts, colour, line numbers, or however the caller likes) is
+//! the caller's job; `defc` is the reference renderer.
+//!
+//! [`Definition`]: defs::text::Definition
 
+pub mod build;
 pub mod lower;
+pub mod manifest;
 pub mod reader;
+
+pub use self::build::{
+    BinSummary, BuildDiagnostic, BuildError, BuildReport, DiagnosticLabel, Progress, Severity,
+    SourceFile, build, build_with_progress,
+};
 
 pub use self::reader::{Args, DefReader, DefReaderError, EvalError, Evaluator};
 

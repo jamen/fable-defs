@@ -78,6 +78,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "def-compiler-sys"
+version = "0.1.0"
+dependencies = [
+ "codespan-reporting",
+ "def-compiler",
+]
+
+[[package]]
 name = "defc"
 version = "0.1.0"
 dependencies = [

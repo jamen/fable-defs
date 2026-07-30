@@ -25,15 +25,25 @@
               "rust-analyzer"
             ];
             targets = [
+              # def-compiler-sys ships an MSVC-ABI static library, because the
+              # consumer (EgoCore) is an MSVC v143 x64 project and mingw archives
+              # do not link cleanly into one.
+              "x86_64-pc-windows-msvc"
               "x86_64-pc-windows-gnu"
             ];
           })
+          # Cross-links the MSVC target from Linux: fetches the Windows SDK and
+          # CRT import libraries and drives lld-link. See packages/def-compiler-sys.
+          cargo-xwin
+          llvmPackages.bintools
           pkgsCross.mingwW64.stdenv.cc
           pkgsCross.mingwW64.windows.pthreads
         ];
 
         shellHook = ''
           export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc
+          # Keep the downloaded Windows SDK out of $HOME and inside the repo.
+          export XWIN_CACHE_DIR="$PWD/target/xwin"
         '';
       };
     };

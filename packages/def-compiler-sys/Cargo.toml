@@ -1,0 +1,22 @@
+[package]
+name = "def-compiler-sys"
+description = "C ABI for the Fable def compiler"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+publish.workspace = true
+
+[lib]
+# `staticlib` for linking the compiler straight into a native binary,
+# `cdylib` for loading it as a shared library, `rlib` so the crate's own
+# tests can link against it.
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+def-compiler = { path = "../def-compiler" }
+# Same renderer defc uses, so a GUI consumer gets the same diagnostics the CLI
+# prints — source excerpt and caret included — just without the colour codes.
+codespan-reporting = "0.13"
