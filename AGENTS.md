@@ -62,9 +62,12 @@ living onboarding doc — keep it current.
 
 | Resource | Path |
 |---|---|
-| Fable decompilation | `~/git/fable-decomp` |
+| Fable decompilation | `~/git/fable-decomp` — **absent as of 2026-07**; the `Transfer<T>` type/order oracle (§5) is unavailable until it is restored |
+| OpenAlbion (upstream monorepo) | `~/git/OpenAlbion` — **absent as of 2026-07** |
 | Retail binaries (ground truth) | `~/Fable/data/CompiledDefs/backup-retail-verified/` |
 | Anniversary debug build (text defs) | `~/doc/Fable_Anniversary-2013-02-25/Fable/Data/` |
+| Live game install (Unified Build; ships **both** header sets, §4.1.1) | `~/Fable/data/Defs/` |
+| EgoCore (downstream consumer; links `def-compiler-sys`) | `~/git/EgoCore` — its `FableDefCompiler/` is a C++ reimplementation, useful as a behavioural oracle |
 | In-game test artifact | `~/fable-scratch-build/` |
 
 ```bash
@@ -186,7 +189,11 @@ bespoke arm stringly-typed).
 | `header.rs` | `HeaderParser` → `#define` / `enum` / `namespace` / `#ifdef` items |
 | `symbols.rs` | `SymbolTable::evaluate` — header items → flat `name → i64` map |
 | `base.rs` | Shared span infrastructure (`Span`, `Spanned<T>`, `LineIndex`, `ParseError<T>`); the old char-cursor machinery is gone (§11) |
-| `manifest.rs` | `SHARED_HEADERS` / `PC_HEADERS` / `XBOX_HEADERS` — the list of 40 `.h` header files to load |
+
+> There is **no `text/manifest.rs`** and never was in this repo — the curated
+> `SHARED_HEADERS`/`PC_HEADERS`/`XBOX_HEADERS` list this table used to name is from the
+> pre-extraction OpenAlbion design. Header discovery is a recursive scan with explicit
+> variant resolution; see **§4.1.1**.
 
 Load-bearing properties:
 
@@ -197,10 +204,47 @@ Load-bearing properties:
 - **Statement order is preserved** through parsing and flattening — load-bearing, because
   method-call DSLs (`Animation.StartGroup` … `Add` … `EndGroup`) and `Field.clear()` have
   positional semantics.
-- **`SymbolTable` duplicates keep the first value** (inverts the C preprocessor's last-wins
-  rule — validated by golden, don't "fix" casually).
+- **`SymbolTable` duplicates: the last definition wins**, and a duplicate is *never* fatal.
+  `insert` returns the value it replaced; `evaluate`/`evaluate_items` return a
+  `Vec<Redefinition>` that `build.rs` reports as warnings. Matches the C preprocessor and
+  the retail tooling's `m_SymbolMap[name] = value`. Golden does **not** constrain this
+  (the corpus has zero duplicate symbols), so the old "keeps the first value — validated
+  by golden" note was wrong on both counts (§4.1.1).
 - `object.rs` (data-format's `OBJECT → mesh` resolver) **reimplements the `specialises`
   walk** in stringly form — a drift risk (§9).
+
+#### 4.1.1 Header discovery — variant sets
+
+`Data/Defs` does **not** ship one flat set of headers. It ships *complete variants of the
+same set*, along two axes:
+
+| Axis | Variants | Resolution |
+|---|---|---|
+| Build | `RetailHeaders/` vs `DevHeaders/` | `HEADER_SET_ROOTS` in `build.rs`, most-preferred first; only the winner is scanned |
+| Platform | `pc/` vs `xbox/` within a set | `IGNORED_PLATFORM_DIRS` skips `xbox` |
+
+`RetailHeaders/` is exactly `DevHeaders/` minus `xbox/` — the same ~15 logical files
+(`meshdata.h`, `text.h`, `pc/textures.h`, …). Reading both unions two copies of every
+symbol into one namespace. **`RetailHeaders` wins**: it is the richer set (the `DevHeaders`
+lipsync headers are empty stubs holding 0 symbols against 20,505) and it is the set the
+modding tools write to. The two agree on every shared name/value pair, so the choice is
+byte-neutral for a stock corpus — verified: `DevHeaders`-only, `RetailHeaders`-only, and
+both-scanned all produce identical `game/frontend/script/names.bin`. It decides only
+*which set a mod's edits are read from*. The Anniversary debug corpus ships only
+`DevHeaders/`, so selection is a no-op there and golden is unaffected.
+
+The ~47 `.h` at the corpus root are shared and always read. When a set is skipped the
+build warns, naming it — a modder who patched the losing set otherwise sees their symbols
+silently vanish.
+
+> **The bug this exists to prevent** (2026-07, `DTB Hei Mask` / EgoCore): both sets were
+> scanned; `DevHeaders/*` sorted first and claimed every symbol; each `RetailHeaders/*`
+> file then hit a duplicate on its *first* enum variant, and — because a duplicate aborted
+> the rest of the file — was discarded whole. ~44,900 symbol definitions dropped at
+> warning severity. The mod had patched `RetailHeaders/`, so its five new symbols never
+> reached the table and surfaced as one `unknown symbol` error 5,279 lines away in
+> `objects_clothing.def`. Two independent defects: fatal duplicates, and unioned variant
+> sets. Both are fixed; regression tests in `build.rs::tests` and `symbols.rs::tests`.
 
 ### 4.2 The schema layer — proc-macro derives (`defs-derive`)
 
@@ -946,13 +990,15 @@ FieldRef::U8(slot) => { *slot = v as u8; }  // 300 → 44, silently
 
 ### 12.6 P3: Other gaps
 
-- **Duplicate def names**: ~800 duplicate instance names silently overwrite at
-  `build.rs:474` (`build_defs_by_name`) and `mod.rs:240` (per-file `by_name`). Scan for
-  collisions and emit a warning per duplicate.
-- **Header parse failures**: `build.rs:134-138` — if any of the 40 `.h` header files fails to
-  read, parse, or evaluate, it's silently skipped. Three `let _ =` discard points. Also at
-  `build.rs:560`, `.def`-file-local headers evaluate with `let _ = symbols.evaluate_items(...)`.
-  Surface these to stderr or as diagnostics.
+- **Duplicate def names**: ~800 duplicate instance names silently overwrite in
+  `collect_named` and `mod.rs`'s per-file `by_name`. Scan for collisions and emit a warning
+  per duplicate. **Still open** — §15 once listed this as done; there is no such code and a
+  stock build emits zero duplicate-name warnings.
+- **Header failures**: ~~silently skipped~~ **fixed** — a header that fails to read, parse,
+  or evaluate is now `Severity::Error` and fails the build at the header, in both
+  `load_symbols` and the `.def`-file-local `evaluate_items` path. Previously these were
+  warnings, so one malformed header turned into thousands of "unknown symbol" errors at
+  distant use sites (measured: a single `0x`-hex enum value produced 7,336). See §4.1.1.
 - **Missing `#end_definition` recovery**: handled at parse time (correct).
 
 ---
@@ -1114,7 +1160,11 @@ After §13 changes land (byte-identical), verify that:
       `sub_fail > 0` blocks build
 - [ ] Enum typing P2 (§13.3) — needs decomp extraction first
 - [x] P3 diagnostics (§§12.4-12.6) — `from_i32_or_first` replaced with strict helper;
-      integer narrowing range checks added; header failures surfaced; duplicate def name
-      warnings emitted (~1161 for the retail corpus)
+      integer narrowing range checks added; header failures now **errors** (§4.1.1)
+- [ ] Duplicate def name warnings (§12.6) — **not implemented**; this line previously
+      claimed ~1,161 warnings were emitted, but no such code exists and a stock build
+      emits zero. Left open rather than silently dropped.
+- [x] Header-set variant resolution + non-fatal duplicate symbols (§4.1.1) — fixes mods
+      being silently ignored when they patch `RetailHeaders/`
 - [ ] Unit tests for lowering (§9 Track C)
 - [ ] Quality (R8 object.rs, R6 assembly, R4/R5 schema-ization)

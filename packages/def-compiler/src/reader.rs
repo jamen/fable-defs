@@ -807,7 +807,7 @@ mod eval_tests {
     fn populated_syms(symbols: &[(&str, i64)]) -> Evaluator<'static> {
         let mut table = SymbolTable::new();
         for &(name, value) in symbols {
-            table.insert(name, value).unwrap();
+            table.insert(name, value);
         }
         Evaluator::new(Box::leak(Box::new(table)))
     }

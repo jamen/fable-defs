@@ -5,6 +5,10 @@ resolver = "3"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+# Binding constraint is let-chains in `if` (stabilized 1.88); edition 2024 needs
+# 1.85 and resolver 3 needs 1.84. Declared so cargo reports "requires rustc
+# 1.88" instead of failing deep in a dependency with an unstable-feature error.
+rust-version = "1.88"
 license = "Zlib"
 repository = "https://github.com/jamen/fable-defs"
 homepage = "https://github.com/jamen/fable-defs"

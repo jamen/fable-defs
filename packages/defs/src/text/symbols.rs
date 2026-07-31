@@ -34,30 +34,56 @@ impl SymbolTable {
 #[derive(Debug)]
 pub enum SymbolEvalError {
     UnknownSymbol(String),
-    DuplicateSymbol(String),
     InvalidShift(i64),
 }
 
+/// A symbol that was already defined when a later definition overwrote it.
+///
+/// A redefinition is **not** an error: the corpus legitimately ships variant
+/// header sets, and overriding a stock symbol is a normal modding operation.
+/// It is reported so an *unintended* shadow is visible rather than silent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Redefinition {
+    pub name: String,
+    /// The value that was in the table, now replaced.
+    pub previous: i64,
+    /// The value that won.
+    pub value: i64,
+}
+
 impl SymbolTable {
-    pub fn evaluate(&mut self, header: &Header) -> Result<(), SymbolEvalError> {
+    /// Evaluate a parsed header file into the table, returning every symbol it
+    /// redefined.
+    pub fn evaluate(&mut self, header: &Header) -> Result<Vec<Redefinition>, SymbolEvalError> {
         self.evaluate_items(&header.items)
     }
     /// Evaluate a list of header items (e.g. the file-local `enum`/`#define`
     /// declarations parsed from a `.def` file) into the table.
-    pub fn evaluate_items(&mut self, items: &[HeaderItem]) -> Result<(), SymbolEvalError> {
+    pub fn evaluate_items(
+        &mut self,
+        items: &[HeaderItem],
+    ) -> Result<Vec<Redefinition>, SymbolEvalError> {
+        let mut redefined = Vec::new();
         for item in items {
-            self.evaluate_header_item(item)?;
+            self.evaluate_header_item(item, &mut redefined)?;
         }
-        Ok(())
+        Ok(redefined)
     }
-    fn evaluate_header_item(&mut self, item: &HeaderItem) -> Result<(), SymbolEvalError> {
+    fn evaluate_header_item(
+        &mut self,
+        item: &HeaderItem,
+        redefined: &mut Vec<Redefinition>,
+    ) -> Result<(), SymbolEvalError> {
         use HeaderItem as I;
         match item {
-            I::Enum(decl) => self.evaluate_enum(decl),
-            I::Define(d) => self.insert(&d.name, d.value),
+            I::Enum(decl) => self.evaluate_enum(decl, redefined),
+            I::Define(d) => {
+                self.define(&d.name, d.value, redefined);
+                Ok(())
+            }
             I::Namespace(ns) => {
                 for item in &ns.items {
-                    self.evaluate_header_item(item)?;
+                    self.evaluate_header_item(item, redefined)?;
                 }
                 Ok(())
             }
@@ -69,30 +95,49 @@ impl SymbolTable {
                     ifdef.else_branch.as_deref().unwrap_or(&[])
                 };
                 for item in branch {
-                    self.evaluate_header_item(item)?;
+                    self.evaluate_header_item(item, redefined)?;
                 }
                 Ok(())
             }
         }
     }
-    fn evaluate_enum(&mut self, decl: &EnumDecl) -> Result<(), SymbolEvalError> {
+    fn evaluate_enum(
+        &mut self,
+        decl: &EnumDecl,
+        redefined: &mut Vec<Redefinition>,
+    ) -> Result<(), SymbolEvalError> {
         let mut last_value: Option<i64> = None;
         for variant in &decl.variants {
             let value = match &variant.value {
                 Some(expr) => self.evaluate_enum_expr(expr)?,
                 None => last_value.map_or(0, |v| v + 1),
             };
-            self.insert(&variant.name, value)?;
+            self.define(&variant.name, value, redefined);
+            // Advance the auto-increment cursor from the value this variant
+            // declared, whether or not it displaced an earlier symbol —
+            // numbering follows the enum being read, not the table.
             last_value = Some(value);
         }
         Ok(())
     }
-    pub fn insert(&mut self, name: &str, value: i64) -> Result<(), SymbolEvalError> {
-        if self.map.contains_key(name) {
-            return Err(SymbolEvalError::DuplicateSymbol(name.to_string()));
+    /// Insert, recording a redefinition if the name was already bound.
+    fn define(&mut self, name: &str, value: i64, redefined: &mut Vec<Redefinition>) {
+        if let Some(previous) = self.insert(name, value) {
+            redefined.push(Redefinition {
+                name: name.to_string(),
+                previous,
+                value,
+            });
         }
-        self.map.insert(name.to_string(), value);
-        Ok(())
+    }
+    /// Bind `name` to `value`, returning the value it replaced, if any.
+    ///
+    /// Last definition wins, matching both the C preprocessor and the retail
+    /// tooling's `m_SymbolMap[name] = value`. An earlier design made a
+    /// duplicate an error that aborted the *rest of the header file*, which
+    /// silently discarded every symbol below the first collision.
+    pub fn insert(&mut self, name: &str, value: i64) -> Option<i64> {
+        self.map.insert(name.to_string(), value)
     }
     fn is_defined(&self, cond: &str) -> bool {
         cond == "_WINDOWS"
@@ -120,5 +165,88 @@ impl SymbolTable {
                 .map(|t| self.evaluate_enum_expr(t))
                 .try_fold(0i64, |acc, v| Ok(acc | v?)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::header::parse_header_file;
+    use super::*;
+
+    fn eval(table: &mut SymbolTable, src: &str) -> Vec<Redefinition> {
+        let header = parse_header_file(src).expect("header parses");
+        table.evaluate(&header).expect("header evaluates")
+    }
+
+    #[test]
+    fn last_definition_wins() {
+        let mut t = SymbolTable::new();
+        eval(&mut t, "enum E { A = 1 };");
+        let redefined = eval(&mut t, "enum E { A = 2 };");
+        assert_eq!(t.lookup("A"), Some(2));
+        assert_eq!(
+            redefined,
+            vec![Redefinition {
+                name: "A".into(),
+                previous: 1,
+                value: 2
+            }]
+        );
+    }
+
+    /// The regression this module was rewritten for: a duplicate used to abort
+    /// evaluation of the whole file, silently dropping every symbol below it.
+    /// A mod that re-declares an enum to append symbols lost exactly the
+    /// symbols it was adding.
+    #[test]
+    fn duplicate_does_not_discard_the_rest_of_the_file() {
+        let mut t = SymbolTable::new();
+        eval(&mut t, "enum EMeshType2 { MESH_A = 1, MESH_B = 2 };");
+        eval(
+            &mut t,
+            "enum EMeshType2 { MESH_A = 1, MESH_B = 2, MESH_NEW = 3 };",
+        );
+        assert_eq!(t.lookup("MESH_NEW"), Some(3), "symbol after the duplicate");
+        assert_eq!(t.lookup("MESH_A"), Some(1));
+        assert_eq!(t.lookup("MESH_B"), Some(2));
+    }
+
+    /// Redefinition must not be reported for a fresh name, or every additive
+    /// header would drown the log.
+    #[test]
+    fn new_symbols_are_not_redefinitions() {
+        let mut t = SymbolTable::new();
+        let redefined = eval(&mut t, "enum E { A = 1, B = 2 };");
+        assert!(redefined.is_empty());
+    }
+
+    /// Auto-increment numbering follows the enum being read, not the table, so
+    /// a redefinition mid-enum does not shift the variants after it.
+    #[test]
+    fn auto_increment_unaffected_by_redefinition() {
+        let mut t = SymbolTable::new();
+        eval(&mut t, "enum E { A = 40 };");
+        eval(&mut t, "enum F { A = 1, B, C };");
+        assert_eq!(t.lookup("A"), Some(1));
+        assert_eq!(t.lookup("B"), Some(2));
+        assert_eq!(t.lookup("C"), Some(3));
+    }
+
+    #[test]
+    fn unknown_symbol_in_enum_expression_is_still_an_error() {
+        let mut t = SymbolTable::new();
+        let header = parse_header_file("enum E { A = NOPE };").unwrap();
+        assert!(matches!(
+            t.evaluate(&header),
+            Err(SymbolEvalError::UnknownSymbol(n)) if n == "NOPE"
+        ));
+    }
+
+    #[test]
+    fn insert_reports_the_replaced_value() {
+        let mut t = SymbolTable::new();
+        assert_eq!(t.insert("A", 1), None);
+        assert_eq!(t.insert("A", 2), Some(1));
+        assert_eq!(t.lookup("A"), Some(2));
     }
 }

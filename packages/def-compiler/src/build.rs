@@ -31,7 +31,7 @@ use defs::binary::{
 use defs::crc32;
 use defs::text::{
     DefFile, DefParseError, Definition, Expr, Span, Spanned, Statement, SymbolTable,
-    TextParseErrorKind, header::parse_header_file, parse_def_file,
+    TextParseErrorKind, header::parse_header_file, parse_def_file, symbols::Redefinition,
 };
 use defs::names::NamesBuilder;
 
@@ -224,13 +224,15 @@ pub fn build_with_progress(
         diagnostics: diagnostics.take(),
     };
 
-    // A parse error is fatal for its file — every def in it is dropped. Letting
-    // the build succeed anyway means silently emitting binaries that are missing
-    // defs, which is exactly the failure the diagnostics exist to prevent.
-    let parse_failures = diagnostics.count(Severity::Error);
-    if parse_failures > 0 {
+    // A file that fails to load is fatal: a bad `.def` drops every def in it,
+    // and a bad `.h` drops the symbols every def referencing them needs.
+    // Continuing would silently emit binaries missing defs, or bury the real
+    // cause under a pile of "unknown symbol" errors at distant use sites —
+    // exactly the failures the diagnostics exist to prevent.
+    let load_failures = diagnostics.count(Severity::Error);
+    if load_failures > 0 {
         return Err(finish(
-            format!("{parse_failures} file(s) failed to parse"),
+            format!("{load_failures} source file(s) failed to load"),
             corpus.sources,
             &diagnostics,
         ));
@@ -507,17 +509,90 @@ static SCRIPT_CONFIG: BinConfig = BinConfig {
 //  Phase 1: Parse the entire corpus once
 // ═══════════════════════════════════════════════════════════════════════════════
 
-fn collect_h_files(dir: &Path, out: &mut Vec<PathBuf>) {
+/// Directories under the corpus root that each hold a **complete variant of
+/// the same header set**, most-preferred first.
+///
+/// `Data/Defs` does not ship one flat set of headers. `RetailHeaders/` and
+/// `DevHeaders/` are two builds of the same ~15 files (`meshdata.h`, `text.h`,
+/// `pc/textures.h`, …), so scanning both unions two copies of every symbol
+/// into one namespace. Exactly one set must win.
+///
+/// `RetailHeaders` is preferred because it is the richer of the two — the
+/// `DevHeaders` lipsync headers are empty stubs — and because it is the set the
+/// modding tools write to. The two agree on every shared name/value pair, so
+/// the choice does not change the compiled output of a stock corpus; it decides
+/// only which set a mod's edits are read from. A corpus with just one of them
+/// (the Anniversary debug build ships only `DevHeaders/`) is unaffected.
+const HEADER_SET_ROOTS: &[&str] = &["RetailHeaders", "DevHeaders"];
+
+/// Platform variants *within* a header set. Same problem one level down:
+/// `pc/textures.h` and `xbox/textures.h` define the same names.
+const IGNORED_PLATFORM_DIRS: &[&str] = &["/xbox/"];
+
+/// Pick the header set to read, and report the ones being skipped.
+///
+/// The skipped sets are named because a modder who patched the losing set
+/// would otherwise see their symbols silently vanish — the exact failure this
+/// resolution exists to prevent.
+fn select_header_set(source: &Path, diagnostics: &Diagnostics) -> Option<&'static str> {
+    let present: Vec<&'static str> = HEADER_SET_ROOTS
+        .iter()
+        .copied()
+        .filter(|root| source.join(root).is_dir())
+        .collect();
+    let (&winner, skipped) = present.split_first()?;
+    if !skipped.is_empty() {
+        let list = skipped
+            .iter()
+            .map(|r| format!("{r}/"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        diagnostics.push(BuildDiagnostic::bare(
+            Severity::Warning,
+            format!(
+                "using header set {winner}/; ignoring {list} \
+                 (same headers, one set must win — edits to the ignored set are not read)"
+            ),
+        ));
+    }
+    Some(winner)
+}
+
+/// Collect the `.h` files to read.
+///
+/// All variant matching is done on the path **relative to the corpus root**.
+/// Matching the absolute path would make the compiler's behaviour depend on
+/// where the corpus happens to live — a directory called `xbox` or
+/// `DevHeaders` anywhere above the root would silently skip every header.
+fn collect_h_files(dir: &Path, root: &Path, selected_set: Option<&str>, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+    let root_prefix = normalize_path(root);
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.is_dir() {
-            collect_h_files(&path, out);
+            collect_h_files(&path, root, selected_set, out);
         } else if matches!(path.extension().and_then(|e| e.to_str()), Some("h")) {
-            let s = normalize_path(&path);
-            if s.contains("/xbox/") || s.contains("scriptdialoguesnds2") {
+            let full = normalize_path(&path);
+            // Leading `/` so a segment match is always `/segment/`, including
+            // for a variant root sitting directly at the corpus root.
+            let rel = match full.strip_prefix(&root_prefix) {
+                Some(r) => format!("/{}", r.trim_start_matches('/')),
+                None => full.clone(),
+            };
+            if IGNORED_PLATFORM_DIRS.iter().any(|d| rel.contains(d))
+                || rel.contains("scriptdialoguesnds2")
+            {
+                continue;
+            }
+            // Headers outside every variant root (the ~47 at the corpus root)
+            // are shared and always read.
+            let losing_set = HEADER_SET_ROOTS
+                .iter()
+                .filter(|r| Some(**r) != selected_set)
+                .any(|r| rel.contains(&format!("/{r}/")));
+            if losing_set {
                 continue;
             }
             out.push(path);
@@ -525,33 +600,39 @@ fn collect_h_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Read every header in the selected set into one symbol table.
+///
+/// A header that cannot be read, parsed, or evaluated is an **error**: it
+/// contributes no symbols (or, for an evaluate failure, only those before the
+/// failure), so letting the build continue turns one broken header into a
+/// distant pile of "unknown symbol" errors at the use sites.
 fn load_symbols(source: &Path, diagnostics: &Diagnostics) -> SymbolTable {
     let mut symbols = SymbolTable::new();
+    let selected_set = select_header_set(source, diagnostics);
     let mut h_files = Vec::new();
-    collect_h_files(source, &mut h_files);
+    collect_h_files(source, source, selected_set, &mut h_files);
     h_files.sort();
     for path in &h_files {
         let display = normalize_path(path);
         match std::fs::read_to_string(path) {
             Ok(t) => match parse_header_file(&t) {
-                Ok(hd) => {
-                    if let Err(e) = symbols.evaluate(&hd) {
-                        diagnostics.push(BuildDiagnostic::bare(
-                            Severity::Warning,
-                            format!("header {display}: evaluate error: {e:?}"),
-                        ));
-                    }
-                }
+                Ok(hd) => match symbols.evaluate(&hd) {
+                    Ok(redefined) => report_redefinitions(&display, &redefined, diagnostics),
+                    Err(e) => diagnostics.push(BuildDiagnostic::bare(
+                        Severity::Error,
+                        format!("header {display}: evaluate error: {e:?}"),
+                    )),
+                },
                 Err(e) => {
                     diagnostics.push(BuildDiagnostic::bare(
-                        Severity::Warning,
+                        Severity::Error,
                         format!("header {display}: parse error: {e}"),
                     ));
                 }
             },
             Err(e) => {
                 diagnostics.push(BuildDiagnostic::bare(
-                    Severity::Warning,
+                    Severity::Error,
                     format!("header {display}: read error: {e}"),
                 ));
             }
@@ -560,13 +641,48 @@ fn load_symbols(source: &Path, diagnostics: &Diagnostics) -> SymbolTable {
     symbols
 }
 
+/// How many redefinitions to name individually before collapsing to a count.
+/// A regenerated header can redefine thousands of symbols at once, and a log
+/// that long buries every other diagnostic.
+const MAX_REPORTED_REDEFINITIONS: usize = 10;
+
+fn report_redefinitions(display: &str, redefined: &[Redefinition], diagnostics: &Diagnostics) {
+    for r in redefined.iter().take(MAX_REPORTED_REDEFINITIONS) {
+        diagnostics.push(BuildDiagnostic::bare(
+            Severity::Warning,
+            format!(
+                "{display}: symbol {} redefined: {} -> {} (later definition wins)",
+                r.name, r.previous, r.value
+            ),
+        ));
+    }
+    if let Some(rest) = redefined.len().checked_sub(MAX_REPORTED_REDEFINITIONS)
+        && rest > 0
+    {
+        diagnostics.push(BuildDiagnostic::bare(
+            Severity::Warning,
+            format!("{display}: … and {rest} more symbol(s) redefined"),
+        ));
+    }
+}
+
 /// Engine enums the def-script parser registers in C++ (ECompositeBlendType,
 /// _core/L4.hpp) that appear in no text header. The def-script uses the short
 /// `BLEND_*` names (COMPOSITE_ prefix stripped). `BLEND_ALPHA = 2` is confirmed
 /// against retail (every CHeroMorphDef TextureMorph blend); without it,
 /// `TextureMorphs.Add(..., BLEND_ALPHA)` would silently lower the blend to 0.
+///
+/// These are injected *after* the headers are read, so with last-definition-wins
+/// they would override a corpus that does define them. They are fallbacks for
+/// names the text is missing, not overrides, so a header definition keeps
+/// priority. No corpus currently defines any of them.
 fn inject_engine_enums(symbols: &mut SymbolTable) {
-    let _ = symbols.insert("WATER_BUMP_PC", 0);
+    let mut fallback = |name: &str, value: i64| {
+        if symbols.lookup(name).is_none() {
+            symbols.insert(name, value);
+        }
+    };
+    fallback("WATER_BUMP_PC", 0);
     for (name, value) in [
         ("BLEND_NULL", 0),
         ("BLEND_ADDITIVE", 1),
@@ -574,7 +690,7 @@ fn inject_engine_enums(symbols: &mut SymbolTable) {
         ("BLEND_SOLID", 3),
         ("BLEND_MULTIPLY", 4),
     ] {
-        let _ = symbols.insert(name, value);
+        fallback(name, value);
     }
 }
 
@@ -649,9 +765,10 @@ fn parse_corpus(
     }
 
     for (&sid, pf) in source_ids.iter().zip(parsed_files.iter()) {
-        if let Err(e) = symbols.evaluate_items(&pf.def_file.headers) {
-            diagnostics.push(BuildDiagnostic {
-                severity: Severity::Warning,
+        match symbols.evaluate_items(&pf.def_file.headers) {
+            Ok(redefined) => report_redefinitions(&sources[sid].path, &redefined, diagnostics),
+            Err(e) => diagnostics.push(BuildDiagnostic {
+                severity: Severity::Error,
                 message: format!("header evaluation failed: {e:?}"),
                 source: Some(sid),
                 labels: vec![DiagnosticLabel {
@@ -659,7 +776,7 @@ fn parse_corpus(
                     span: Span { start: 0, end: 0 },
                     message: Some("in this file".to_string()),
                 }],
-            });
+            }),
         }
     }
 
@@ -1259,5 +1376,137 @@ mod tests {
         assert!(path_ends_with(&path, "FrontEndDefs/engine.def"));
         assert!(normalize_path(Path::new(r"a\Defs\ScriptDefs\quest.def")).contains("ScriptDefs/"));
         assert!(normalize_path(Path::new(r"a\DevHeaders\xbox\gfx.h")).contains("/xbox/"));
+    }
+
+    // ── header-set resolution ────────────────────────────────────────────────
+
+    /// Build a corpus skeleton under a fresh temp dir: each entry is a path
+    /// relative to the root, created as an empty file.
+    fn corpus(name: &str, files: &[&str]) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("defc-hdr-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for rel in files {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "").unwrap();
+        }
+        root
+    }
+
+    fn selected_headers(root: &Path) -> Vec<String> {
+        let diagnostics = Diagnostics::default();
+        let set = select_header_set(root, &diagnostics);
+        let mut out = Vec::new();
+        collect_h_files(root, root, set, &mut out);
+        let root_str = normalize_path(root);
+        let mut rel: Vec<String> = out
+            .iter()
+            .map(|p| {
+                normalize_path(p)
+                    .strip_prefix(&root_str)
+                    .unwrap()
+                    .trim_start_matches('/')
+                    .to_string()
+            })
+            .collect();
+        rel.sort();
+        rel
+    }
+
+    /// The bug: `Data/Defs` ships two complete variants of the same header set,
+    /// and reading both unions two copies of every symbol into one namespace.
+    #[test]
+    fn retail_header_set_wins_over_dev() {
+        let root = corpus(
+            "both",
+            &[
+                "meshdata_shared.h",
+                "DevHeaders/meshdata.h",
+                "DevHeaders/pc/textures.h",
+                "RetailHeaders/meshdata.h",
+                "RetailHeaders/pc/textures.h",
+            ],
+        );
+        assert_eq!(
+            selected_headers(&root),
+            vec![
+                "RetailHeaders/meshdata.h",
+                "RetailHeaders/pc/textures.h",
+                // Headers outside every variant root are shared, never skipped.
+                "meshdata_shared.h",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The Anniversary debug corpus ships only `DevHeaders/`; selection must be
+    /// a no-op there or the golden build changes.
+    #[test]
+    fn lone_dev_header_set_is_used() {
+        let root = corpus("devonly", &["action_def.h", "DevHeaders/meshdata.h"]);
+        assert_eq!(
+            selected_headers(&root),
+            vec!["DevHeaders/meshdata.h", "action_def.h"]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Platform variants are the same problem one level down.
+    #[test]
+    fn xbox_platform_variant_is_skipped() {
+        let root = corpus(
+            "xbox",
+            &["DevHeaders/pc/textures.h", "DevHeaders/xbox/textures.h"],
+        );
+        assert_eq!(selected_headers(&root), vec!["DevHeaders/pc/textures.h"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A corpus with no variant roots at all keeps the plain recursive scan.
+    #[test]
+    fn corpus_without_variant_roots_reads_everything() {
+        let root = corpus("flat", &["a.h", "sub/b.h"]);
+        assert_eq!(selected_headers(&root), vec!["a.h", "sub/b.h"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Variant matching is relative to the corpus root. Matching the absolute
+    /// path would make the result depend on where the corpus lives: a corpus
+    /// stored under a directory called `xbox` or `DevHeaders` would have every
+    /// header skipped and produce symbol-less binaries.
+    #[test]
+    fn variant_matching_ignores_directories_above_the_corpus_root() {
+        let outer = corpus("nested", &["xbox/DevHeaders/Defs/action_def.h"]);
+        let inner = outer.join("xbox/DevHeaders/Defs");
+        assert_eq!(selected_headers(&inner), vec!["action_def.h"]);
+        let _ = std::fs::remove_dir_all(&outer);
+    }
+
+    /// Skipping a set silently is what made the original bug so hard to see:
+    /// a mod patched the ignored set and its symbols vanished with no signal.
+    #[test]
+    fn ignored_header_set_is_reported() {
+        let root = corpus(
+            "warn",
+            &["DevHeaders/meshdata.h", "RetailHeaders/meshdata.h"],
+        );
+        let diagnostics = Diagnostics::default();
+        select_header_set(&root, &diagnostics);
+        let diags = diagnostics.take();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].severity, Severity::Warning);
+        assert!(diags[0].message.contains("DevHeaders/"), "{:?}", diags[0]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One set present means nothing is being ignored, so nothing to report.
+    #[test]
+    fn single_header_set_reports_nothing() {
+        let root = corpus("quiet", &["DevHeaders/meshdata.h"]);
+        let diagnostics = Diagnostics::default();
+        select_header_set(&root, &diagnostics);
+        assert!(diagnostics.take().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
