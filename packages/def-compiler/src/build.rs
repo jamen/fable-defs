@@ -955,13 +955,38 @@ fn build_nulldefs(
     Ok(map)
 }
 
+/// Allocate the next `ClassIndex` for `class_name` — the third word of the
+/// entry's `NameRef`.
+///
+/// This is **one 0-based counter per class, spanning every emission pass** in
+/// global-index order: the NULLDEF first, then named entries, then anonymous
+/// sub-def entries. Retail writes it from `CInstantiatedDefInfo::ClassIndex`
+/// (`lib_definition_manager.cpp:1581`) and reads it back through
+/// `CDefinitionManager::GetDefClassIndexFromGlobalIndex`.
+///
+/// **`0` is the engine's "no such def" sentinel.** An unset `DefIndex` is `0`,
+/// which resolves to whichever NULLDEF sits at global index 0; call sites test
+/// the resulting class index against `0` to decide "unset". So the NULLDEF of
+/// every class *must* be 0 and named entries *must* start at 1 — otherwise an
+/// unset reference reads as class index 1 and silently resolves to the first
+/// real def of that class. (This was the local-detail bug: every theme with no
+/// `LocalDetailGeneratorDef` resolved to class index 1 —
+/// `LOCAL_DETAIL_BRIGHTWOOD_BIRCH_BRACKEN` — and the world editor scattered
+/// birch and bracken across every untextured surface.)
+fn next_class_index(counters: &mut HashMap<String, u32>, class_name: &str) -> u32 {
+    let slot = counters.entry(class_name.to_string()).or_insert(0);
+    let index = *slot;
+    *slot += 1;
+    index
+}
+
 fn emit_nulldef_and_named(
     entries: &mut Vec<Built>,
     nulldef_entries: &[&str],
     named_order: &[String],
     ctx: &BuildCtx,
+    class_index: &mut HashMap<String, u32>,
 ) -> Result<usize, String> {
-    let mut nulldef_counter: HashMap<String, u32> = HashMap::new();
     for &class_name in nulldef_entries {
         let fnm = format!("NULLDEF_{class_name}");
         let body = ctx
@@ -969,14 +994,13 @@ fn emit_nulldef_and_named(
             .get(class_name)
             .ok_or_else(|| format!("NULLDEF body missing for {class_name}"))?
             .clone();
-        let cc = nulldef_counter.entry(class_name.to_string()).or_insert(0);
-        *cc += 1;
+        let counter = next_class_index(class_index, class_name);
         let def_name_off = ctx.names.borrow_mut().intern(class_name);
         let file_name_off = ctx.names.borrow_mut().intern(&fnm);
         entries.push(Built {
             def_name_off,
             file_name_off,
-            counter: *cc,
+            counter,
             preamble: EntryPreamble {
                 is_real: false,
                 is_template: false,
@@ -991,7 +1015,6 @@ fn emit_nulldef_and_named(
         });
     }
 
-    let mut class_counter: HashMap<String, u32> = HashMap::new();
     let mut n_ok = 0;
     let mut error_count = 0;
     for name in named_order {
@@ -1036,12 +1059,11 @@ fn emit_nulldef_and_named(
                 continue;
             }
         };
-        let cc = class_counter.entry(def_type.clone()).or_insert(0);
-        *cc += 1;
+        let counter = next_class_index(class_index, &def_type);
         entries.push(Built {
             def_name_off,
             file_name_off,
-            counter: *cc,
+            counter,
             preamble: EntryPreamble {
                 is_real: true,
                 is_template: false,
@@ -1154,10 +1176,10 @@ fn build_subdefs(
     named_base: usize,
     ctx: &BuildCtx,
     entries: &mut Vec<Built>,
+    class_index: &mut HashMap<String, u32>,
 ) -> Result<(usize, usize), String> {
     let mut sub_dedup: HashMap<(String, Vec<u8>), u32> = HashMap::new();
     let mut sub_entries: Vec<Built> = Vec::new();
-    let mut sub_counter: HashMap<String, u32> = HashMap::new();
     let (mut sub_ok, mut sub_fail) = (0, 0);
     for (oi, name) in named_order.iter().enumerate() {
         let owner_index = (named_base + oi) as u32;
@@ -1221,12 +1243,11 @@ fn build_subdefs(
                 .entry((tag.clone(), bytes.clone()))
                 .or_insert_with(|| {
                     let idx = sub_entries.len() as u32;
-                    let cc = sub_counter.entry(tag.clone()).or_insert(0);
-                    *cc += 1;
+                    let counter = next_class_index(class_index, tag);
                     sub_entries.push(Built {
                         def_name_off: ctx.names.borrow_mut().intern(tag),
                         file_name_off: u32::MAX,
-                        counter: *cc,
+                        counter,
                         preamble: EntryPreamble {
                             is_real: true,
                             is_template: false,
@@ -1323,11 +1344,27 @@ fn build_one_bin(
         named: named_order.len(),
     });
     let mut entries: Vec<Built> = Vec::new();
-    let lowered = emit_nulldef_and_named(&mut entries, config.nulldef_entries, &named_order, &ctx)?;
+    // One 0-based `ClassIndex` counter per class, shared across all three
+    // emission passes so it runs continuously in global-index order. See
+    // `next_class_index`.
+    let mut class_index: HashMap<String, u32> = HashMap::new();
+    let lowered = emit_nulldef_and_named(
+        &mut entries,
+        config.nulldef_entries,
+        &named_order,
+        &ctx,
+        &mut class_index,
+    )?;
 
     let named_base = nulldef_count as usize;
     let (sub_defs_lowered, sub_defs_unique) = if config.has_subdefs {
-        build_subdefs(&named_order, named_base, &ctx, &mut entries)?
+        build_subdefs(
+            &named_order,
+            named_base,
+            &ctx,
+            &mut entries,
+            &mut class_index,
+        )?
     } else {
         (0, 0)
     };
@@ -1352,6 +1389,35 @@ fn build_one_bin(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The engine treats `ClassIndex 0` as "no such def": an unset `DefIndex` is
+    /// `0`, resolves to whichever NULLDEF sits at global index 0, and call sites
+    /// test the resulting class index against `0`. So each class's NULLDEF must
+    /// be `0` and its first real entry must be `1`.
+    ///
+    /// The bug this pins: three independent per-pass counters, each starting at
+    /// `1`, gave the NULLDEF `1` *and* the first named entry `1`. Themes with no
+    /// `LocalDetailGeneratorDef` then resolved to class index 1 —
+    /// `LOCAL_DETAIL_BRIGHTWOOD_BIRCH_BRACKEN` — instead of "none".
+    #[test]
+    fn class_index_is_zero_based_and_continuous_across_passes() {
+        let mut counters = HashMap::new();
+        // NULLDEF pass, then the named pass, then anonymous sub-defs — one
+        // continuous run per class, in global-index order.
+        assert_eq!(next_class_index(&mut counters, "LOCAL_DETAIL_GENERATOR"), 0);
+        assert_eq!(next_class_index(&mut counters, "LOCAL_DETAIL_GENERATOR"), 1);
+        assert_eq!(next_class_index(&mut counters, "LOCAL_DETAIL_GENERATOR"), 2);
+        // Counters are per class, not global.
+        assert_eq!(next_class_index(&mut counters, "ARMOUR"), 0);
+        assert_eq!(next_class_index(&mut counters, "LOCAL_DETAIL_GENERATOR"), 3);
+
+        // `CONTROL_SCHEME` has *two* NULLDEF entries in frontend.bin, so they
+        // take 0 and 1 and named entries start at 2 — as retail emits them.
+        let mut cs = HashMap::new();
+        assert_eq!(next_class_index(&mut cs, "CONTROL_SCHEME"), 0);
+        assert_eq!(next_class_index(&mut cs, "CONTROL_SCHEME"), 1);
+        assert_eq!(next_class_index(&mut cs, "CONTROL_SCHEME"), 2);
+    }
 
     #[test]
     fn path_matching_respects_path_boundaries() {

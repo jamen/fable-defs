@@ -404,11 +404,39 @@ manifest slices, and the game-only sub-def region):
 DefBinary   := header(13B) · NameRef[n](12B) · ChunkIndexHeader(8B)
              · ChunkIndexEntry[chunks](8B) · sentinel ChunkIndexEntry (REQUIRED —
                chunk offsets are relative to the region after it) · zlib chunks
+NameRef     := def_name_offset(u32) · file_name_offset(u32) · ClassIndex(u32)
 EntryRecord := preamble(3B: is_real, is_template, AreDefaultValsApplied)
              · [sub-def table: u16 count · 12B records]  — iff type derives the sub-def bases
              · body: field controls (u32 crc32(name) · wire value)…
 names.bin   := 20B header (off8=StringCount, off12=StreamLength) · (u32 crc · NUL utf8)…
 ```
+
+- **`NameRef.ClassIndex` is load-bearing and the differ cannot see it.** It is
+  retail's `CInstantiatedDefInfo::ClassIndex` (written at
+  `lib_definition_manager.cpp:1581`, read back by
+  `CDefinitionManager::GetDefClassIndexFromGlobalIndex`): **one 0-based counter
+  per class**, running continuously in global-index order across all three
+  emission passes — NULLDEF first, then named entries, then anonymous sub-defs.
+  `CONTROL_SCHEME` has two NULLDEFs in frontend.bin, so they take 0 and 1 and its
+  named entries start at 2.
+  > **`0` is the engine's "no such def" sentinel.** An unset `DefIndex` is `0`,
+  > which resolves to whichever NULLDEF sits at global index 0; consumers test the
+  > resulting class index against `0` to mean "unset" — e.g.
+  > `engine_local_detail_cache.cpp:4759` does
+  > `if (GetDefClassIndexFromGlobalIndex(...) != 0) ld_theme = GeneratorThemes[idx]`.
+  > Emitting 1-based indices makes every unset reference resolve to the *first real
+  > def of that class*. That was the 2026-08 local-detail bug (§8): 260 NULLDEFs
+  > across all three binaries were off by one, so every theme without a
+  > `LocalDetailGeneratorDef` resolved to class index 1 —
+  > `LOCAL_DETAIL_BRIGHTWOOD_BIRCH_BRACKEN` — and the world editor scattered birch
+  > and bracken over bare ground, or crashed on the collision.
+  >
+  > **Why the divergence hunt missed it:** `verify.rs` decodes entry *bodies* only.
+  > Nothing in the semantic ledger, and nothing in golden before it was re-blessed,
+  > ever compared the `NameRef` table. A systematic 260-entry defect survived the
+  > "divergence closure complete" sign-off in §8 because of that blind spot.
+  > `probe_counter` / `probe_counter_diff` exist to check it; a ledger arm for
+  > `NameRef` would be better.
 
 - **Sub-def table presence is a per-wire-name property** (`def_name_has_subdef_table`,
   generated from `sub_def_names!` in `def_binary.rs` — 106 wire names deriving
@@ -582,6 +610,14 @@ via the R12 spike only.
 
 The divergence-onion phase is complete. The semantic ledger (§5) now surfaces only verified
 genuine artifacts.  **Summary of remaining divergences** (2026-07-25):
+
+> **⚠️ "Complete" means *bodies* are complete.** In 2026-08 a systematic defect was found
+> **outside** everything this section measures: all 260 NULLDEF entries across the three
+> binaries carried a 1-based `NameRef.ClassIndex` where retail is 0-based (§4.7). The ledger
+> compares decoded entry bodies and never looks at the `NameRef` table, so it reported a
+> clean sweep throughout. Read the tables below as "no known body divergences", not "no
+> known divergences" — and treat any container-level field the differ doesn't decode as
+> unverified until something checks it.
 
 ### Named ledger
 
