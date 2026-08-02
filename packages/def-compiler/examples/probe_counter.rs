@@ -10,7 +10,8 @@ fn main() {
     let want = std::env::args().nth(2);
     let bin = std::env::var("BIN").unwrap_or_else(|_| "game".into());
     let names = Names::load(&Path::new(&dir).join("names.bin")).unwrap();
-    let b = DefBinary::load_with_names(&Path::new(&dir).join(format!("{bin}.bin")), &names).unwrap();
+    let b =
+        DefBinary::load_with_names(&Path::new(&dir).join(format!("{bin}.bin")), &names).unwrap();
 
     let mut rows: Vec<(usize, u32, String, String)> = Vec::new();
     for e in b.entries(&names) {

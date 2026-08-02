@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt · clippy · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all --check
+
+      # `-- -D warnings` rather than RUSTFLAGS: it applies only to workspace
+      # crates, so a warning in a dependency cannot fail the build, and cached
+      # dependency artifacts stay valid.
+      #
+      # --all-targets covers examples: verify/probe_field/probe_counter are the
+      # divergence-investigation tooling (AGENTS.md §5) and rot silently otherwise.
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The golden byte-determinism test skips when OA_TEXT_DIR is unset, because
+      # the Fable corpus is not redistributable. So this runs the unit tests only
+      # and golden stays a local gate — see AGENTS.md §5.
+      - run: cargo test --workspace
+
+  build:
+    name: ${{ matrix.name }}
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # musl, not the default gnu target: gnu bakes the build machine's glibc
+          # loader path into the ELF interpreter, so the artifact cannot start on
+          # a machine that lacks that exact path. musl links libc statically and
+          # needs no interpreter. The workspace is pure Rust (miniz_oxide, no
+          # libz-sys), so no C cross-toolchain is required. See flake.nix.
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            bin: defc
+          # MSVC ABI, matching what EgoCore links against (FableDefs.targets).
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: defc.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - run: cargo build --release --locked -p defc --target ${{ matrix.target }}
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" dist/
+          # Most of the size is debug info, and the embedded toolchain paths it
+          # carries are also what makes builds irreproducible.
+          if [ "${{ runner.os }}" = "Linux" ]; then strip "dist/${{ matrix.bin }}"; fi
+          ls -l dist
+
+      # Proves the binary actually starts on a clean runner — the failure mode
+      # this whole target choice exists to prevent does not show up at link time.
+      - name: Smoke test
+        shell: bash
+        run: "dist/${{ matrix.bin }} --help"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: defc-${{ matrix.name }}
+          path: dist/${{ matrix.bin }}
+          if-no-files-found: error
+
+  release:
+    name: Attach binaries to the release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect and checksum
+        run: |
+          mkdir -p dist
+          cp artifacts/defc-linux-x86_64/defc dist/defc
+          cp artifacts/defc-windows-x86_64/defc.exe dist/defc.exe
+          chmod +x dist/defc
+          cd dist && sha256sum defc defc.exe | tee SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/defc
+            dist/defc.exe
+            dist/SHA256SUMS

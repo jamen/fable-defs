@@ -89,7 +89,10 @@ fn main() {
                     bin.label, bin.lowered, bin.sub_defs_lowered, bin.sub_defs_unique, bin.entries,
                 );
             } else {
-                eprintln!("  {}: {} lowered, {} entries", bin.label, bin.lowered, bin.entries);
+                eprintln!(
+                    "  {}: {} lowered, {} entries",
+                    bin.label, bin.lowered, bin.entries
+                );
             }
         }
     };

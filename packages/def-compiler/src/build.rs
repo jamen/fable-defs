@@ -29,11 +29,11 @@ use defs::binary::{
     EntryPreamble, EntryRecord, NameRef, SubDefRecord, def_name_has_subdef_table,
 };
 use defs::crc32;
+use defs::names::NamesBuilder;
 use defs::text::{
     DefFile, DefParseError, Definition, Expr, Span, Spanned, Statement, SymbolTable,
     TextParseErrorKind, header::parse_header_file, parse_def_file, symbols::Redefinition,
 };
-use defs::names::NamesBuilder;
 
 use crate::lower::{LowerError, flatten_specialization, lower_def};
 use crate::manifest;
@@ -162,15 +162,9 @@ impl std::error::Error for BuildError {}
 /// liveness. Purely informational — everything durable is in [`BuildReport`].
 #[derive(Debug)]
 pub enum Progress<'a> {
-    FileParsed {
-        path: &'a str,
-        definitions: usize,
-    },
+    FileParsed { path: &'a str, definitions: usize },
     CompileStarted,
-    Lowering {
-        label: &'static str,
-        named: usize,
-    },
+    Lowering { label: &'static str, named: usize },
     BinFinished(&'a BinSummary),
 }
 
@@ -218,11 +212,12 @@ pub fn build_with_progress(
 
     // From here on any failure can still point at source, so hand the caller
     // the sources and everything collected so far.
-    let finish = |message: String, sources: Vec<SourceFile>, diagnostics: &Diagnostics| BuildError {
-        message,
-        sources,
-        diagnostics: diagnostics.take(),
-    };
+    let finish =
+        |message: String, sources: Vec<SourceFile>, diagnostics: &Diagnostics| BuildError {
+            message,
+            sources,
+            diagnostics: diagnostics.take(),
+        };
 
     // A file that fails to load is fatal: a bad `.def` drops every def in it,
     // and a bad `.h` drops the symbols every def referencing them needs.
@@ -242,7 +237,14 @@ pub fn build_with_progress(
     let names_cell = RefCell::new(NamesBuilder::new());
     let mut bins = Vec::with_capacity(3);
     for config in [&GAME_CONFIG, &FRONTEND_CONFIG, &SCRIPT_CONFIG] {
-        match build_one_bin(&corpus, config, &diagnostics, &names_cell, output, on_progress) {
+        match build_one_bin(
+            &corpus,
+            config,
+            &diagnostics,
+            &names_cell,
+            output,
+            on_progress,
+        ) {
             Ok(summary) => {
                 on_progress(Progress::BinFinished(&summary));
                 bins.push(summary);
@@ -251,7 +253,9 @@ pub fn build_with_progress(
         }
     }
 
-    let names = names_cell.into_inner().finalize(manifest::NAMES_HEADER_BYTES);
+    let names = names_cell
+        .into_inner()
+        .finalize(manifest::NAMES_HEADER_BYTES);
     if let Err(e) = std::fs::write(output.join("names.bin"), names.to_bytes()) {
         return Err(finish(
             format!("write names.bin: {e}"),
@@ -443,9 +447,7 @@ fn frontend_file_scope(corpus: &[ParsedFile]) -> Vec<&ParsedFile> {
         .filter_map(|rel| corpus.iter().find(|pf| path_ends_with(&pf.path, rel)))
         .collect();
     for pf in corpus {
-        if pf.path.contains("/FrontEndDefs/")
-            && !scoped.iter().any(|s| std::ptr::eq(*s, pf))
-        {
+        if pf.path.contains("/FrontEndDefs/") && !scoped.iter().any(|s| std::ptr::eq(*s, pf)) {
             scoped.push(pf);
         }
     }
@@ -737,10 +739,7 @@ fn parse_corpus(
                     path: &path,
                     definitions: def_count,
                 });
-                parsed_files.push(ParsedFile {
-                    path,
-                    def_file: f,
-                });
+                parsed_files.push(ParsedFile { path, def_file: f });
             }
             Err(e) => {
                 let sid = sources.len();
@@ -857,10 +856,7 @@ fn lowering_error_diagnostic(
 ) -> BuildDiagnostic {
     let source = ctx.def_to_source.get(def_name).copied();
     let Some(sid) = source else {
-        return BuildDiagnostic::bare(
-            Severity::Error,
-            format!("{def_type} {def_name}: {error}"),
-        );
+        return BuildDiagnostic::bare(Severity::Error, format!("{def_type} {def_name}: {error}"));
     };
     let text = &ctx.sources[sid].text;
     let mut labels = Vec::new();
@@ -1428,7 +1424,10 @@ mod tests {
             "x/Defs/FrontEndDefs/engine.def",
             "FrontEndDefs/engine.def"
         ));
-        assert!(!path_ends_with("x/Defs/engine.def", "FrontEndDefs/engine.def"));
+        assert!(!path_ends_with(
+            "x/Defs/engine.def",
+            "FrontEndDefs/engine.def"
+        ));
         // A bare relative path with no leading directory still matches at root.
         assert!(path_ends_with("ui_dialogs.def", "ui_dialogs.def"));
     }

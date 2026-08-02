@@ -82,7 +82,11 @@ pub unsafe extern "C" fn defc_build(
             DEFC_ERROR_ARGS
         }
         Err(payload) => {
-            let _ = writeln!(log, "error: def compiler panicked: {}", panic_message(&payload));
+            let _ = writeln!(
+                log,
+                "error: def compiler panicked: {}",
+                panic_message(&payload)
+            );
             DEFC_ERROR_PANIC
         }
     };
@@ -199,7 +203,11 @@ fn render_diagnostics(
 
     log.push_str(&String::from_utf8_lossy(&buffer));
 
-    if let Some(extra) = diagnostics.len().checked_sub(MAX_RENDERED).filter(|n| *n > 0) {
+    if let Some(extra) = diagnostics
+        .len()
+        .checked_sub(MAX_RENDERED)
+        .filter(|n| *n > 0)
+    {
         let _ = writeln!(log, "... and {extra} more diagnostic(s) not shown");
     }
 }
@@ -355,7 +363,10 @@ mod tests {
         let out = std::env::temp_dir().join("defc_sys_diag_format_out");
         let (status, log, _) = call(dir.to_str().unwrap(), out.to_str().unwrap(), 8192);
 
-        assert_eq!(status, DEFC_ERROR_BUILD, "a parse error must fail the build");
+        assert_eq!(
+            status, DEFC_ERROR_BUILD,
+            "a parse error must fail the build"
+        );
         // The message leads, so it is visible without scrolling.
         assert!(log.starts_with("error: "), "log was:\n{log}");
         // The path is relative to the corpus root, on its own line.
