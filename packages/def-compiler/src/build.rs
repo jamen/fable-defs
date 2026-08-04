@@ -36,8 +36,9 @@ use defs::text::{
     symbols::{Redefinition, SymbolEvalError},
 };
 
-use crate::lower::{LowerError, flatten_chain, lower_def, specialization_chain};
+use crate::lower::{LowerError, chain_runs, lower_def, specialization_chain};
 use crate::manifest;
+use crate::reader::Body;
 use crate::reader::{DefReaderError, EvalError};
 use crate::walk_def_files;
 
@@ -323,8 +324,8 @@ impl Diagnostics {
 
     /// Drain, merging repeats of one mistake and ordering by source position.
     ///
-    /// Specialization fan-out is why this exists. `flatten_specialization`
-    /// copies a template's statements into every descendant, so one bad
+    /// Specialization fan-out is why this exists. A template's statements are
+    /// read by every descendant, so one bad
     /// statement in a widely-inherited template is lowered once per descendant
     /// and reported once per descendant — every report with its caret on the
     /// same byte of the same template, because that is the only place the
@@ -968,9 +969,9 @@ fn lowering_error_diagnostic(
     let mut labels = Vec::new();
     let primary = error.primary_span();
     // The span names its own file. That matters here because the statement may
-    // have been inherited: `flatten_specialization` copies a template's
-    // statements into the child, so the span can belong to a different file than
-    // the definition being compiled.
+    // have been inherited: a template's statements are read by every child, so
+    // the span can belong to a different file than the definition being
+    // compiled.
     if let Some(span) = primary {
         labels.push(DiagnosticLabel {
             source: span.file.0 as usize,
@@ -1088,7 +1089,7 @@ fn build_nulldefs(
         }
         // A NULLDEF body is `def_default()` with no statements applied, so this
         // can only fail if the type is missing from the schema entirely.
-        let body = lower_def(dn, None, &[], symbols, def_indices, names)
+        let body = lower_def(dn, None, Body::EMPTY, symbols, def_indices, names)
             .map_err(|e| format!("NULLDEF lowering failed for {dn}: {e}"))?;
         map.insert(dn.to_string(), body);
     }
@@ -1217,12 +1218,14 @@ fn emit_nulldef_and_named<'a>(
                 continue;
             }
         };
-        let body = flatten_chain(&chain);
+        // Read the chain in place. Concatenating it produced 7× the corpus's
+        // own statements in clones, all of it discarded after lowering.
+        let runs = chain_runs(&chain);
 
         let lowered = match lower_def(
             &def_type,
             ctx.nulldefs.get(def_type.as_str()).as_ref().copied(),
-            &body,
+            Body::Chain(&runs),
             ctx.symbols,
             ctx.def_indices,
             ctx.names,
@@ -1418,13 +1421,10 @@ fn build_subdefs(
                 });
                 continue;
             }
-            // Concatenated only here, and dropped before the next block.
-            let blk: Vec<Spanned<Statement>> =
-                bodies.iter().flat_map(|b| b.iter().cloned()).collect();
             let lowered = match lower_def(
                 tag,
                 ctx.nulldefs.get(tag).as_ref().copied(),
-                &blk,
+                Body::Chain(bodies),
                 ctx.symbols,
                 ctx.def_indices,
                 ctx.names,

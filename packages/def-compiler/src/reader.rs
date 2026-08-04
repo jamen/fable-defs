@@ -457,6 +457,102 @@ impl std::fmt::Display for DefReaderError {
     }
 }
 
+// ── Body ─────────────────────────────────────────────────────────────────────
+
+/// A definition body: a sequence of statements the compiler reads, **without
+/// requiring that they be contiguous in memory**.
+///
+/// Lowering never indexes or slices a body — it only iterates one. Keeping that
+/// the only requirement is what lets a specialization chain be read in place:
+/// flattening one used to clone 681,479 statements across the corpus (7× the
+/// definitions' own bodies) purely so [`DefReader`] could borrow them back.
+///
+/// [`Body::Refs`] is the form the bespoke arms' filters produce — selecting a
+/// subset copies pointers rather than statements.
+#[derive(Clone, Copy)]
+pub enum Body<'a> {
+    /// One contiguous run — a single definition's own body.
+    Flat(&'a [Spanned<Statement>]),
+    /// Runs read back to back: a specialization chain most-distant-first, or a
+    /// tagged block merged across one.
+    Chain(&'a [&'a [Spanned<Statement>]]),
+    /// An explicit selection, e.g. what remains after a bespoke arm takes the
+    /// statements it handles itself.
+    Refs(&'a [&'a Spanned<Statement>]),
+}
+
+impl<'a> Body<'a> {
+    pub const EMPTY: Body<'static> = Body::Flat(&[]);
+
+    pub fn iter(&self) -> BodyIter<'a> {
+        match *self {
+            Body::Flat(s) => BodyIter::Flat(s.iter()),
+            Body::Chain(runs) => BodyIter::Chain {
+                runs: runs.iter(),
+                run: [].iter(),
+            },
+            Body::Refs(r) => BodyIter::Refs(r.iter()),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match *self {
+            Body::Flat(s) => s.len(),
+            Body::Chain(runs) => runs.iter().map(|r| r.len()).sum(),
+            Body::Refs(r) => r.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match *self {
+            Body::Flat(s) => s.is_empty(),
+            Body::Chain(runs) => runs.iter().all(|r| r.is_empty()),
+            Body::Refs(r) => r.is_empty(),
+        }
+    }
+}
+
+impl<'a> From<&'a [Spanned<Statement>]> for Body<'a> {
+    fn from(body: &'a [Spanned<Statement>]) -> Self {
+        Body::Flat(body)
+    }
+}
+
+impl<'a> IntoIterator for Body<'a> {
+    type Item = &'a Spanned<Statement>;
+    type IntoIter = BodyIter<'a>;
+
+    fn into_iter(self) -> BodyIter<'a> {
+        self.iter()
+    }
+}
+
+pub enum BodyIter<'a> {
+    Flat(std::slice::Iter<'a, Spanned<Statement>>),
+    Chain {
+        runs: std::slice::Iter<'a, &'a [Spanned<Statement>]>,
+        run: std::slice::Iter<'a, Spanned<Statement>>,
+    },
+    Refs(std::slice::Iter<'a, &'a Spanned<Statement>>),
+}
+
+impl<'a> Iterator for BodyIter<'a> {
+    type Item = &'a Spanned<Statement>;
+
+    fn next(&mut self) -> Option<&'a Spanned<Statement>> {
+        match self {
+            BodyIter::Flat(it) => it.next(),
+            BodyIter::Refs(it) => it.next().copied(),
+            BodyIter::Chain { runs, run } => loop {
+                if let Some(stmt) = run.next() {
+                    return Some(stmt);
+                }
+                *run = runs.next()?.iter();
+            },
+        }
+    }
+}
+
 // ── DefReader ────────────────────────────────────────────────────────────────
 
 struct Entry<'a> {
@@ -471,9 +567,10 @@ pub struct DefReader<'a, 's> {
 }
 
 impl<'a, 's> DefReader<'a, 's> {
-    pub fn new(body: &'a [Spanned<Statement>], symbols: &'s SymbolTable) -> Self {
+    pub fn new(body: impl Into<Body<'a>>, symbols: &'s SymbolTable) -> Self {
         Self {
             entries: body
+                .into()
                 .iter()
                 .map(|s| Entry {
                     stmt: s,

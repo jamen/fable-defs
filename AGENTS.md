@@ -67,23 +67,22 @@ cargo run -q -p defc -- $TEXT/Defs <out_dir>
 | Definitions | 10,454 |
 | Output entries | game 13,239 · frontend 851 · script 611 |
 | game.bin composition | NULLDEFs + 9,264 named + 3,726 distinct anonymous sub-defs (33,525 lowered, deduped) |
-| **Total build** | **~0.95 s** (was 3.8 s before §9 Track A Phase 1) |
+| **Total build** | **~0.65 s** (was 3.8 s before §9 Track A Phase 1) |
 
 **Per-phase, on the game.bin path** (~85% of the build; frontend + script are ~0.06 s). Measured
-by replaying the pipeline through the public API — see the recipe in §10. The replica's template
-filter is cruder than the real build's (8,838 vs 9,264 named), so these run ~5% under.
+by replaying the pipeline through the public API — see the recipe in §10.
 
 | Phase | before | now |
 |---|---|---|
-| parse 61 headers + evaluate symbols | 49 | 50 |
-| parse 177 `.def`/`.tpl` | 138 | 137 |
+| parse 61 headers + evaluate symbols | 49 | 44 |
+| parse 177 `.def`/`.tpl` | 138 | 133 |
 | index space (`collect_body_references` + `collect_named`) | 25 | 5 |
 | lower 249 NULLDEF bodies | 3 | 2 |
-| `flatten_specialization`, named pass | 390 | **394** ← the one left (fix 4) |
-| `flatten_specialization`, sub-def pass — a duplicate call | 345 | 0 |
-| lower ~9,264 named bodies | 291 | **97** |
-| tagged-block merge → 33,525 sub-def inputs | 46 | now borrowed, not cloned |
-| lower 33,525 sub-def bodies (→ 3,726 distinct) | 269 | **~25** (memoized) |
+| flatten the specialization chain, named pass | 390 | **4** |
+| flatten again for the sub-def pass — a duplicate call | 345 | 0 |
+| lower ~9,264 named bodies | 291 | **82** |
+| tagged-block merge → 33,525 sub-def inputs | 46 | 14 |
+| lower 33,525 sub-def bodies (→ 3,726 distinct) | 269 | **~25** (126 un-memoized) |
 | move bodies into `EntryRecord` | 102 | 102 |
 | serialize ~12.5k entries (6.8 MB) | 15 | 15 |
 | **chunk split** | **1,804** | **32** |
@@ -92,8 +91,13 @@ filter is cruder than the real build's (8,838 vs 9,264 named), so these run ~5% 
 > **The old headline "lower + emit game.bin = 88%" was an artefact of the measurement**, which
 > timed the gap between two progress lines and attributed all of it to lowering. Lowering was
 > 15%, and nearly half the build was an accidental quadratic in the chunk split. Everything
-> removed so far was **redundant work, not necessary work** — the output has been byte-identical
-> at every step. Re-measure before optimising anything; these numbers drive §9.
+> removed was **redundant work, not necessary work** — the output stayed byte-identical at every
+> step. Re-measure before optimising anything; these numbers drive §9.
+
+**Parsing is now the largest single item** (177 ms, ~27% of the build): 52 ms lexing at
+248 MB/s, the rest building the AST, where every symbol and number literal becomes an owned
+`String`. That is what makes the file-level parse cache the top item in §9's Phase 3b rather
+than the afterthought the original plan made it.
 
 ---
 
@@ -102,8 +106,8 @@ filter is cruder than the real build's (8,838 vs 9,264 named), so these run ~5% 
 ```
  INPUTS                     defs (format layer)             def-compiler
 ┌──────────────┐   ┌──────────────────────────────────┐   ┌────────────────────────┐
-│ Defs/*.def    │──▶│ parse_source → SourceAst {        │──▶│ flatten_specialization │
-│ Defs/*.tpl    │   │   items: Vec<Item> }              │   │  (parent-first concat) │
+│ Defs/*.def    │──▶│ parse_source → SourceAst {        │──▶│ specialization_chain   │
+│ Defs/*.tpl    │   │   items: Vec<Item> }              │   │  (read parent-first)   │
 │ Defs/**/*.h   │──▶│   Item = Definition | Enum |      │   │ lower_def dispatch:    │
 │               │   │     Define | Namespace |          │   │  • ~35 bespoke arms    │
 │ manifest.rs   │   │     Conditional | PragmaOnce      │   │  • lower_generic via   │
@@ -135,10 +139,10 @@ Controls.Add(CActionInputControl(…));  → Statement::MethodCall (object path,
 <CTavernGameDef> … <\CTavernGameDef>   → Statement::TaggedBlock (tag, body)
 ```
 
-**Stage 2 — specialization flattening** (`lower::flatten_specialization`). The `specialises`
-chain concatenates most-distant-ancestor-first into one statement list. With downstream
-last-wins semantics this reproduces the game compiler's copy-parent-then-apply. Same-tag
-tagged blocks **merge** (parent first), never replace.
+**Stage 2 — specialization** (`lower::specialization_chain`). The `specialises`
+chain is read most-distant-ancestor-first as one statement sequence (`Body::Chain`, never
+materialized — §9). With downstream last-wins semantics this reproduces the game compiler's
+copy-parent-then-apply. Same-tag tagged blocks **merge** (parent first), never replace.
 
 **Stage 3 — lowering** (`def-compiler::lower`). `lower_def` dispatches on def type name.
 ~35 bespoke arms handle C++-specific logic (§4.5); the remaining ~210 flow through
@@ -202,7 +206,7 @@ and only `.def`/`.tpl` contribute definitions. Only the grammar is unified.
 Load-bearing properties:
 
 - **Spans carry their file** (`Span { file: FileId, start, end }`). Non-negotiable:
-  `flatten_specialization` clones a template's statements into every inheriting definition,
+  a template's statements are read by every inheriting definition,
   spans included, so a span routinely outlives the file it was read from. Without the file id
   a diagnostic interprets the offset against the wrong text and points confidently at
   unrelated code. There is **deliberately no `Span::join`** — combining spans is only
@@ -494,7 +498,7 @@ struct DiagnosticLabel { source: usize, primary: bool, span: Span, message: Opti
 
 `Diagnostics::take()` merges repeats of one mistake and orders everything by (file, offset).
 
-Specialization fan-out is why: `flatten_specialization` copies a template's statements into
+Specialization fan-out is why: a template's statements are read by
 every descendant, so one bad statement is lowered and reported once per descendant, every
 report pointing at the same byte of the same template. `OBJECT_BASE` has 3,147 transitive
 descendants. Merged output is one diagnostic plus a count:
@@ -723,18 +727,19 @@ distinct `(tag, statement-list)` inputs (they dedup to 3,726 distinct *outputs*)
 
 #### A.1 Phase 1 — the algorithmic fixes (no cache, byte-identical, golden-gated)
 
-**Status: done except fix 4. Build is 3.8 s → 0.95 s, output byte-identical throughout.**
+**Status: complete. Build is 3.8 s → 0.65 s (~5.8×), output byte-identical throughout.**
 
-Every one of these turned out to be *the same bug in four places*: work proportional to the
-whole corpus being redone or re-copied per definition.
+Every one of these turned out to be *the same bug in five places*: work proportional to the
+whole corpus being redone or re-copied per definition. Not one was a wrong algorithm in the
+sense of a wrong output — the four binaries were byte-for-byte unchanged at every step.
 
 | # | Fix | Result |
 |---|---|---|
 | 1 ✅ | **Chunk split.** `assemble_and_write` looped `remaining.drain(..split)`, memmoving the tail of a `Vec<EntryRecord>` (5,152 B each) once per chunk. Precompute sizes, find boundaries, consume in one forward pass. | **1,804 → 32 ms** (3.8 → 1.6 s) |
-| 3 ✅ | **`flatten_specialization` ran twice per def.** Split into `specialization_chain` + `flatten_chain`; the named pass resolves the chain once and collects the merged tagged blocks off it, **borrowed** from the ASTs. | **1.6 → 1.43 s** |
-| 2 ✅ | **`strip_superseded_by_clear` deep-cloned every body.** It returned `body.to_vec()` when there was nothing to strip, which is nearly always — 681k statement clones. Return `Cow`. | lowering **275 → 96 ms** (1.43 → 1.15 s) |
-| 5 ✅ | **Sub-def lowering memoized on its input.** Borrowed blocks make `(tag, [(ptr, len)])` an exact key; inheriting the same block from a template is the whole redundancy. | **1.15 → 0.95 s** |
-| 4 ⬜ | **Stop materializing the flattened body.** Still the largest single item at **~390 ms**. | not started |
+| 3 ✅ | **`flatten_specialization` ran twice per def.** The named pass resolves the chain once and collects the merged tagged blocks off it, **borrowed** from the ASTs. | 1.6 → 1.43 s |
+| 2 ✅ | **`strip_superseded_by_clear` deep-cloned every body** — it returned `body.to_vec()` when there was nothing to strip, which is nearly always. | lowering **275 → 96 ms** (1.43 → 1.15 s) |
+| 5 ✅ | **Sub-def lowering memoized on its input.** Borrowed blocks make `(tag, [(ptr, len)])` an exact key; inheriting the same block from a template is the whole redundancy. | 1.15 → 0.95 s |
+| 4 ✅ | **Chains are read in place, never flattened.** `Body` (below) replaced the concatenation entirely. | **0.95 → 0.65 s** |
 
 > **Fix 2 is not the fix that was planned, and the planned one was wrong.** The prediction was
 > that `DefReader`'s by-name accessors — which scan the whole body per lookup, several times per
@@ -746,14 +751,44 @@ whole corpus being redone or re-copied per definition.
 > the padding probe measured was mostly the *clone*, not the scan. Revisit the index only if a
 > corpus with much larger bodies appears.
 
-**Fix 4, the remaining one.** 97,342 own statements become 681,479 after flattening (7.0×
-fan-out) at ~530 ns each — purely to be *borrowed*, since `DefReader::new` stores
-`&Spanned<Statement>` and never the values. Feed it the chain as a list of slices instead.
-`DefReader` itself is easy (a `from_slices` constructor); the work is that `body: &[Spanned<Statement>]`
-threads through all of `lower.rs`, and `strip_superseded_by_clear`, `partition_method_calls`,
-`filter_out_fields` and `build_thing_components` each build filtered `Vec`s from it. It wants a
-small `Body<'a>` type wrapping `&[&[Spanned<Statement>]]`. This is a real refactor — worth doing,
-but it is the one step here that is not local.
+##### `Body`: a def body need not be contiguous
+
+The observation that made fix 4 mechanical rather than a rewrite: **all 33 functions in
+`lower.rs` that took `body: &[Spanned<Statement>]` only ever call `body.iter()`.** Nothing
+indexes or slices a body. So the contiguity that flattening provided was never needed —
+`DefReader::new` stores `&Spanned<Statement>` and never the values.
+
+```rust
+#[derive(Clone, Copy)]
+pub enum Body<'a> {
+    Flat(&'a [Spanned<Statement>]),          // one run — a definition's own body
+    Chain(&'a [&'a [Spanned<Statement>]]),   // runs read back to back
+    Refs(&'a [&'a Spanned<Statement>]),      // an explicit selection
+}
+```
+
+- **`Chain` *is* the flattening.** Reading a specialization chain's bodies most-distant-first,
+  with the reader's last-wins overrides, reproduces copy-parent-then-apply exactly. There is
+  deliberately **no function that concatenates a chain into a `Vec`** — `flatten_specialization`
+  and `flatten_chain` were removed rather than left public, because a helper that materializes
+  7× the corpus sitting next to the reason it was removed is a trap. Use
+  `specialization_chain` + `chain_runs` + `Body::Chain`.
+- **`Refs` is what filtering produces.** `filter_out_field(s)`, `partition_method_calls`,
+  `partition_field_calls`, `strip_superseded_by_clear` and the five hand-written filter loops in
+  §4.5's arms collect `Vec<&Spanned<Statement>>` — pointers, not statements.
+  `strip_superseded_by_clear` keeps a nothing-to-strip early-out, so the common path allocates
+  nothing at all.
+
+Both callers ended up *simpler*: the named pass hands `Body::Chain` the chain it already
+resolved, and `build_subdefs` hands it the merged block's slices directly instead of
+concatenating them.
+
+> Considered and rejected: instead of filtering, pre-mark the filtered-out statements as
+> `consumed` in the `DefReader` — "filtered out" and "already consumed" really are the same
+> thing, and it would allocate nothing at all. It requires `lower_generic` to take a built
+> `DefReader` rather than a body, which inverts ~25 call sites and moves the filtering
+> *semantics* of the bespoke arms into the reader. `Refs` got the same allocation win for a
+> fraction of the disturbance. Revisit only if the pointer vectors show up in a profile.
 
 Cross-cutting, still open: `size_of::<DefBody>() = 5,080 B` is why moving bodies into
 `EntryRecord` costs 102 ms and why fix 1 was so dramatic. Boxing the large variants shrinks the
@@ -969,13 +1004,18 @@ zlib 35 ms + cache read ~10 ms ≈ **120 ms**, plus link and re-lowering whateve
 **Parsing (165 ms) is then the single largest remaining item**, which inverts the old plan's
 "file-hash layer buys at most 10%, low priority" — it is Phase 3b, not an afterthought.
 
-> **Be honest about the remaining prize.** Phase 1 has already taken the build from 3.8 s to
-> **0.95 s**, and fix 4 should land it near 0.6 s — with no cache, no format change and no
-> re-bless. Against that baseline the cache buys roughly **2×** (~0.3 s warm), or ~4× once
-> parsing is cached too — not the order of magnitude the original "lowering is 88%" framing
-> implied. **Phase 2 and 3 should be re-justified against these numbers before the relocation
-> work starts.** The cache is worth building if a sub-second rebuild is still too slow for
-> EgoCore's edit-compile loop; that is a product question, not a compiler one.
+> **Be honest about the remaining prize.** Phase 1 took the build from 3.8 s to **0.65 s** with
+> no cache, no format change and no re-bless. What is left on the game.bin path is roughly
+> 177 ms parse · 82 ms lower named · 25 ms lower sub-defs · 102 ms moving bodies into
+> `EntryRecord` · 82 ms serialize + chunk + zlib.
+>
+> A warm rebuild cannot go below the parts that must run every time — link, serialize, chunk,
+> zlib, plus the cache read — which is **~150 ms**, or ~330 ms if parsing is not cached. So the
+> cache buys roughly **2×**, or ~4× with a parse cache. Not the order of magnitude the original
+> "lowering is 88%" framing implied. **Phase 2 and 3 should be re-justified against these
+> numbers before the relocation work starts** — and note that a parse cache (Phase 3b) is
+> simpler than the relocation table and now worth more than lowering is. Whether a 0.65 s
+> rebuild is too slow for EgoCore's edit-compile loop is a product question, not a compiler one.
 
 #### A.4 Settled for this track
 
@@ -1082,9 +1122,10 @@ time ./target/release/defc -i $TEXT/Defs -o /tmp/out
 # which is exactly how "lowering is 88% of the build" got into this document when
 # lowering is 15%. Measure by replaying the pipeline through the public API in a
 # throwaway `packages/def-compiler/tests/` harness instead: `lower_def`,
-# `flatten_specialization`, `manifest::*`, `parse_source`, `SymbolTable`,
-# `NamesBuilder`, `Chunk`/`DefBinary` are all public, so the game.bin path can be
-# rebuilt phase by phase with an `Instant` between each. Delete it afterwards.
+# `specialization_chain`, `chain_runs`, `Body`, `manifest::*`, `parse_source`,
+# `SymbolTable`, `NamesBuilder`, `Chunk`/`DefBinary` are all public, so the game.bin
+# path can be rebuilt phase by phase with an `Instant` between each. Delete it
+# afterwards.
 
 # In-game test — deploy all four; ROLLBACK from $REF if it won't load
 cp <out_dir>/{game,frontend,script,names}.bin ~/Fable/data/CompiledDefs/
@@ -1106,7 +1147,7 @@ cp $REF/{game,frontend,script,names}.bin ~/Fable/data/CompiledDefs/   # rollback
 | `packages/defs/src/def/*.rs` | ~273 def struct declarations, one module per type |
 | `packages/defs-derive/src/lib.rs` | The five derives + `#[def]`/`#[flags]` attr parsing |
 | `packages/def-compiler/src/reader.rs` | `Evaluator`/`Args`/`DefReader` |
-| `packages/def-compiler/src/lower.rs` | `flatten_specialization`; `Applier`; ~35 bespoke arms; `lower_def`/`lower_generic` |
+| `packages/def-compiler/src/lower.rs` | `specialization_chain`; `Body`; `Applier`; ~35 bespoke arms; `lower_def`/`lower_generic` |
 | `packages/def-compiler/src/build.rs` | Corpus parsing, assembly, **all diagnostic construction** |
 | `packages/def-compiler/src/manifest.rs` | Generated retail membership + NULLDEF lists |
 | `packages/defc/src/main.rs` | CLI + diagnostic rendering |

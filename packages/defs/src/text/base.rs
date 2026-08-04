@@ -19,10 +19,9 @@ impl FileId {
 /// Byte offsets, not char offsets — `&source[start..end]` reproduces the text.
 ///
 /// **The file is part of the span**, because spans outlive the file they were
-/// read from. `flatten_specialization` clones a template's statements into every
-/// definition that inherits them, spans included, so by the time an error is
-/// raised the span may belong to a different file than the definition being
-/// compiled. Without the file id there is no way to recover which, and a
+/// read from. A template's statements are read by every definition that
+/// inherits them, spans included, so by the time an error is raised the span
+/// may belong to a different file than the definition being compiled. Without the file id there is no way to recover which, and a
 /// diagnostic that interprets the offset against the wrong text points
 /// confidently at unrelated code.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
