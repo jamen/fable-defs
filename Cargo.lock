@@ -72,14 +72,14 @@ dependencies = [
 
 [[package]]
 name = "def-compiler"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "defs",
 ]
 
 [[package]]
 name = "def-compiler-sys"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "codespan-reporting",
  "def-compiler",
@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "defc"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "argh",
  "codespan-reporting",
@@ -98,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "defs"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "bytemuck",
  "defs-derive",
@@ -108,7 +108,7 @@ dependencies = [
 
 [[package]]
 name = "defs-derive"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "proc-macro2",
  "quote",

@@ -3,7 +3,7 @@ members = ["packages/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.3.1"
 edition = "2024"
 # Binding constraint is let-chains in `if` (stabilized 1.88); edition 2024 needs
 # 1.85 and resolver 3 needs 1.84. Declared so cargo reports "requires rustc

@@ -14,6 +14,14 @@ use def_compiler::{BuildDiagnostic, Progress, Severity, SourceFile};
 /// Fable def compiler
 #[derive(argh::FromArgs)]
 struct Args {
+    /// print version and exit
+    // Never read: `--version` is handled in `main` before argh runs, because
+    // argh would reject it for missing the required positionals. Declared so
+    // `--help` documents the flag.
+    #[allow(dead_code)]
+    #[argh(switch)]
+    version: bool,
+
     /// input directory containing .def, .tpl, and .h files
     #[argh(positional)]
     source: PathBuf,
@@ -75,6 +83,14 @@ fn render(files: &SimpleFiles<&str, &str>, diagnostics: &[BuildDiagnostic]) {
 }
 
 fn main() {
+    // Handled before argh, not through it: `source` and `output` are required
+    // positionals, so `defc --version` on its own fails to parse. The `version`
+    // switch on `Args` exists so `--help` still lists it.
+    if std::env::args().any(|a| a == "--version") {
+        println!("defc {}", env!("DEFC_VERSION"));
+        return;
+    }
+
     let args: Args = argh::from_env();
 
     let mut on_progress = |event: Progress| match event {
