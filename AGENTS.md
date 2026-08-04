@@ -67,7 +67,7 @@ cargo run -q -p defc -- $TEXT/Defs <out_dir>
 | Definitions | 10,454 |
 | Output entries | game 13,239 · frontend 851 · script 611 |
 | game.bin composition | NULLDEFs + 9,264 named + 3,726 distinct anonymous sub-defs (33,525 lowered, deduped) |
-| **Total build** | **~0.65 s** (was 3.8 s before §9 Track A Phase 1) |
+| **Total build** | **~0.56 s** (was 3.8 s before §9 Track A) |
 
 **Per-phase, on the game.bin path** (~85% of the build; frontend + script are ~0.06 s). Measured
 by replaying the pipeline through the public API — see the recipe in §10.
@@ -94,9 +94,10 @@ by replaying the pipeline through the public API — see the recipe in §10.
 > removed was **redundant work, not necessary work** — the output stayed byte-identical at every
 > step. Re-measure before optimising anything; these numbers drive §9.
 
-**Parsing is now the largest single item** — 152 ms plus 18 ms of symbol evaluation, ~26% of the
-build: 63 ms lexing, the rest building the AST. Both halves are **allocation-bound, not
-algorithm-bound** (§9 A.3), and parsing parallelises 5.5× because files are independent.
+Reading and parsing now run in parallel (§9 A.3 step 1), which is why the total is below the sum
+of the sequential phases above. Parsing was 152 ms of a 650 ms build; largest-first scheduling
+across 12 cores took it to ~17 ms. What is left is **allocation-bound, not algorithm-bound**:
+~1.27 M allocations for 1.12 M tokens, about one per token.
 
 ---
 
@@ -663,7 +664,7 @@ Don't relitigate:
 - The 16 KB chunk envelope. Output is ~1.17 MB larger than retail but content is
   byte-identical — the size gap is the TARGET, not a correctness gap.
 - The canonical corpus compiles silently (§5).
-- **No def cache** (§9 A.2). The build is 0.65 s; a cache buys under 2× and risks silent
+- **No def cache** (§9 A.2). The build is 0.56 s; a cache buys ~1.4× and risks silent
   wrong output. `Body` reading chains in place (§9 A.1) is the shape lowering keeps.
 
 Facet reflection was evaluated as the long-term home for `visit.rs` (its `Shape`/`Peek`/`Poke`
@@ -678,7 +679,7 @@ map onto the hand-rolled reflection) but deferred — it's 0.1.x/experimental.
 This track began as "incremental compilation: a `redb`-backed cache so an edit-compile cycle
 costs time proportional to what changed". **It ended somewhere else.** Measuring per phase
 showed the premise was wrong (A.0), removing the redundancy that measurement exposed took the
-build from 3.8 s to 0.65 s with no cache at all (A.1), and that left the cache buying under 2×
+build from 3.8 s to 0.56 s with no cache at all (A.1, A.3), and that left the cache buying ~1.4×
 for a large architectural change and a silent-wrong-output risk — so it is **not being built**
 (A.2). What remains is ordinary optimisation, led by parsing (A.3).
 
@@ -841,15 +842,16 @@ need — though the build-scoped consumption ledger that work actually requires 
 
 #### A.2 Decision: **no def cache.** The prize no longer justifies it
 
-Phase 1 changed the arithmetic that motivated Track A. Against a 0.65 s build:
+Phase 1 changed the arithmetic that motivated Track A. Against the 0.65 s build it left:
 
 | | ms |
 |---|---|
 | A cache could skip: parse 152 · symbol eval 18 · lower named 82 · lower sub-defs 25 · chains + block collection 18 | **~295** |
 | It cannot skip: file I/O 17 · index space 5 · `EntryRecord` moves 102 · serialize 15 · chunk 32 · zlib 35 · frontend + script 60 · cache read ~10 · **plus a new link pass** | **~275** |
 
-So a warm rebuild lands around **0.37 s against 0.65 s — under 2×**, and less than that once the
-parsing work in A.3 lands (it takes the skippable half down by ~120 ms, to roughly **1.5×**).
+So a warm rebuild lands around **0.37 s against 0.65 s — under 2×**. A.3 step 1 has since taken
+parsing off the skippable side almost entirely (152 ms → ~17 ms), so the real figure today is
+**~0.40 s against 0.56 s, about 1.4×**. The case has only got weaker.
 
 **That is not worth what it costs.** The bill is a relocation table threaded through the
 lowering core, an on-disk format with versioning and a schema fingerprint, a shift test, an API
@@ -864,7 +866,8 @@ compile/link split has *standalone* value — see A.4 — not because the cache 
 
 #### A.3 Parsing — the plan
 
-Parsing is the largest remaining item: 152 ms of a ~650 ms build, plus 18 ms evaluating symbols.
+Parsing *was* the largest remaining item — 152 ms of a 650 ms build, plus 18 ms evaluating
+symbols. Step 1 has landed; the measurements below are the ones that shaped the rest.
 Measured with a counting allocator over the whole 238-file, 12.8 MB corpus:
 
 | | time | allocations | allocated | retained |
@@ -883,47 +886,48 @@ Two facts decide the ordering, and both cut against the obvious instinct:
   per token. ~430 k are identifier/number `String`s (the ≤8/≤16/≤32 B buckets); the rest are the
   `Vec`s behind property paths, argument lists and bodies.
 
-##### Step 1 — parse files in parallel. Do this first, and alone
+##### Step 1 ✅ — read and parse files in parallel
 
-**Measured: 154 ms → ~27 ms on 12 cores (5.5×)**, with plain `std::thread::scope` and naive
-static chunking. Better scaling than lowering ever managed (§A.7) because files are independent
-and numerous. This is worth more than every other step here combined, and it is the only one
-that touches no types.
+**Done. Build 0.65 s → 0.56 s**, output byte-identical and verified deterministic over six
+consecutive runs.
 
-`parse_source(&text, FileId) -> Result<SourceAst, _>` is already pure: it reads a `&str` and a
-file id and returns a tree. Nothing is shared, nothing is interned, no diagnostics are pushed.
-The restructuring is entirely in `build.rs`:
+`parse_source(&text, FileId) -> Result<SourceAst, _>` was already pure — a `&str` and a file id
+in, a tree out, nothing shared. Only the scheduling around it was sequential. Both the header set
+and the `.def`/`.tpl` corpus are now read and parsed across threads; **evaluation stays
+sequential and in file order**, which is required because `SymbolTable` is last-definition-wins
+(§4.1). That is the one real constraint in the whole step.
 
-- **`load_symbols` (build.rs:706) currently interleaves parse and evaluate per header** — it
-  parses a header, then immediately calls `symbols.evaluate_items`. Split it: read and parse all
-  headers in parallel, then evaluate in the original order.
-  **`SymbolTable` is last-definition-wins (§4.1), so evaluation must stay sequential and in file
-  order.** This is the one real constraint in the whole step.
-- **`parse_corpus` (build.rs:825) already has the right shape** — it parses all `.def`/`.tpl`
-  files in one loop, then evaluates their declarations in a second loop. Only the first loop
-  moves.
-- **Source ids must be assigned before parsing**, since every span is stamped with one. They
-  already are (`let sid = sources.len()` precedes `parse_source`); with a parallel map they come
-  from the file's index in the sorted walk instead. Deterministic either way.
-- **Diagnostics must be pushed in file order**, not completion order. Collect
-  `Vec<Result<SourceAst, DefParseError>>` indexed by file, then walk it in order pushing errors.
-  `Diagnostics::take()` sorts by (file, offset) anyway, but the *ids* must not depend on
-  scheduling.
-- **Reading the files should move into the parallel phase too** (17 ms, mostly syscall latency).
+**`parallel_map` hands work out largest-first**, and that ordering is the entire scheduling
+strategy: file sizes span 146× (median 10 KB, max 1.5 MB), so the makespan is set by when the
+biggest file *starts*. Measured over the corpus on 12 cores against 91 ms sequential:
 
-Use `std::thread::scope` — no new dependency, and the measured 5.5× already includes the naive
-split. Chunking by *file count* is unbalanced (sizes vary ~100×), so hand out work by index from
-an `AtomicUsize` or pre-sort chunks by file size; expect a little better than 5.5× and much less
-run-to-run variance.
+| | |
+|---|---|
+| static chunks by file count | 25.9 ms |
+| atomic queue, input order | 23.1 ms |
+| `rayon`, global pool | 17.9 ms |
+| **atomic queue, largest first** | **16.5 ms** |
 
-> **Gate: golden must stay green, byte-for-byte.** Parallel parsing changes no output. If it
-> does, the cause is an ordering assumption — almost certainly symbol evaluation or source-id
-> assignment — not a race in the parser.
+> **`rayon` was measured and rejected.** It loses to a 25-line largest-first queue here, because
+> work-stealing's adaptivity buys nothing when there are 238 coarse independent items whose costs
+> are known exactly (file lengths) before starting. It also costs six transitive crates in a
+> deliberately lean tree.
+>
+> The deciding factor is not the 1.4 ms. **`rayon`'s global pool spawns threads that live for the
+> whole process**, and `defc_build` is a C ABI entry point in a cdylib EgoCore loads — threads
+> outliving the call complicate unload, take cores the host may want, and cannot be configured by
+> it. `std::thread::scope` joins every thread before returning. Reach for `rayon` only if
+> something here ever becomes recursive or has unpredictable per-item cost.
 
-**Then stop and re-measure.** After this step parsing is ~30 ms of a ~520 ms build, and steps
-2–5 each shave single-digit milliseconds off a number that is no longer the bottleneck. They may
-not be worth doing at all on time grounds; steps 2–4 remain justified on *memory* and
-*simplicity* grounds, which is how they should be argued from that point on.
+The property parallelism could break silently is **source-id assignment**: a file's id must
+depend only on its position in the sorted walk, never on which thread finished first. Golden
+cannot catch that — a corpus that compiles produces no diagnostics at all — so
+`parse_error_points_at_the_file_it_came_from` in `build.rs::tests` pins it directly.
+
+**Now re-measure before starting step 2.** Parsing is no longer the bottleneck, and steps 2–5
+each shave single-digit milliseconds off a number that no longer dominates. They may not be
+worth doing at all on time grounds; steps 2–4 remain justified on *memory* and *simplicity*
+grounds, which is how they should be argued from here.
 
 ##### Step 2 — `Span` as a global byte offset (24 bytes → 8)
 
@@ -1022,7 +1026,7 @@ long-lived process, and a leak that grows per distinct corpus is a real defect t
 
 ##### Ordering, and what gates each step
 
-1. **Parallel parsing** — no type changes, ~127 ms, golden-gated. **Re-measure before step 2.**
+1. ~~Parallel parsing~~ ✅ — done, 0.65 s → 0.56 s.
 2. **Reserve the token `Vec`** — two lines, ~10 ms, independent of everything.
 3. **`Span` → global offsets** — mechanical but wide; the compiler finds every site. Justified on
    memory and simplification, not on time.
