@@ -94,10 +94,9 @@ by replaying the pipeline through the public API — see the recipe in §10.
 > removed was **redundant work, not necessary work** — the output stayed byte-identical at every
 > step. Re-measure before optimising anything; these numbers drive §9.
 
-**Parsing is now the largest single item** (177 ms, ~27% of the build): 52 ms lexing at
-248 MB/s, the rest building the AST, where every symbol and number literal becomes an owned
-`String`. That is what makes the file-level parse cache the top item in §9's Phase 3b rather
-than the afterthought the original plan made it.
+**Parsing is now the largest single item** — 152 ms plus 18 ms of symbol evaluation, ~26% of the
+build: 63 ms lexing, the rest building the AST. Both halves are **allocation-bound, not
+algorithm-bound** (§9 A.3), and parsing parallelises 5.5× because files are independent.
 
 ---
 
@@ -205,13 +204,21 @@ and only `.def`/`.tpl` contribute definitions. Only the grammar is unified.
 
 Load-bearing properties:
 
-- **Spans carry their file** (`Span { file: FileId, start, end }`). Non-negotiable:
-  a template's statements are read by every inheriting definition,
-  spans included, so a span routinely outlives the file it was read from. Without the file id
-  a diagnostic interprets the offset against the wrong text and points confidently at
-  unrelated code. There is **deliberately no `Span::join`** — combining spans is only
-  meaningful within one file and nothing can guarantee that; productions needing a multi-token
-  range use `Span::new(cursor.file(), start, end)`, taking the file from the cursor.
+- **A span identifies its own file** (today: `Span { file: FileId, start, end }`).
+  Non-negotiable: a template's statements are read by every inheriting definition, spans
+  included, so a span routinely outlives the file it was read from. A span that cannot say which
+  file it belongs to makes a diagnostic interpret the offset against the wrong text and point
+  confidently at unrelated code.
+
+  > This is the *property*, not the representation. §9 A.3 step 2 plans to keep the property
+  > while dropping the per-span `FileId`, by giving every file a disjoint range in one global
+  > byte-offset space — offsets then identify the file on their own. Any redesign must preserve
+  > the property; storing the file id 1.1 M times is not required to.
+
+  There is **deliberately no `Span::join`** — combining spans is only meaningful within one file
+  and nothing can guarantee that; productions needing a multi-token range use
+  `Span::new(cursor.file(), start, end)`, taking the file from the cursor. That rule survives a
+  global offset space unchanged.
 - **AST nodes carry spans** (`Spanned<Statement>`, `Spanned<Expr>`, `PathSegment::Index`,
   `Item::Definition(Spanned<Definition>)`, and all declaration names). `Spanned<T>: PartialEq`
   ignores the span. Corpus files are CRLF; `\r` is trivia.
@@ -656,6 +663,8 @@ Don't relitigate:
 - The 16 KB chunk envelope. Output is ~1.17 MB larger than retail but content is
   byte-identical — the size gap is the TARGET, not a correctness gap.
 - The canonical corpus compiles silently (§5).
+- **No def cache** (§9 A.2). The build is 0.65 s; a cache buys under 2× and risks silent
+  wrong output. `Body` reading chains in place (§9 A.1) is the shape lowering keeps.
 
 Facet reflection was evaluated as the long-term home for `visit.rs` (its `Shape`/`Peek`/`Poke`
 map onto the hand-rolled reflection) but deferred — it's 0.1.x/experimental.
@@ -664,12 +673,17 @@ map onto the hand-rolled reflection) but deferred — it's 0.1.x/experimental.
 
 ## 9. Roadmap
 
-### Track A — Incremental compilation (next major work)
+### Track A — Build performance
 
-**Goal:** an edit-compile cycle costs time proportional to what changed, not to the size of the
-corpus.
+This track began as "incremental compilation: a `redb`-backed cache so an edit-compile cycle
+costs time proportional to what changed". **It ended somewhere else.** Measuring per phase
+showed the premise was wrong (A.0), removing the redundancy that measurement exposed took the
+build from 3.8 s to 0.65 s with no cache at all (A.1), and that left the cache buying under 2×
+for a large architectural change and a silent-wrong-output risk — so it is **not being built**
+(A.2). What remains is ordinary optimisation, led by parsing (A.3).
 
-Three phases, in order. **Phase 1 is not a warm-up for the cache — it is the larger win.**
+**The transferable lesson: measure per phase, and optimise before caching.** A cache would have
+hidden every one of Phase 1's wins behind a warm path and left the cold build at 3.8 s.
 
 #### A.0 Where the time actually goes
 
@@ -825,7 +839,212 @@ Still worth doing when someone touches `DefReader` for other reasons: a name ind
 "which statements did nobody claim" cheap, which is what Track B's unconsumed-statement warnings
 need — though the build-scoped consumption ledger that work actually requires is separate.
 
-#### A.2 Phase 2 — the compile/link split
+#### A.2 Decision: **no def cache.** The prize no longer justifies it
+
+Phase 1 changed the arithmetic that motivated Track A. Against a 0.65 s build:
+
+| | ms |
+|---|---|
+| A cache could skip: parse 152 · symbol eval 18 · lower named 82 · lower sub-defs 25 · chains + block collection 18 | **~295** |
+| It cannot skip: file I/O 17 · index space 5 · `EntryRecord` moves 102 · serialize 15 · chunk 32 · zlib 35 · frontend + script 60 · cache read ~10 · **plus a new link pass** | **~275** |
+
+So a warm rebuild lands around **0.37 s against 0.65 s — under 2×**, and less than that once the
+parsing work in A.3 lands (it takes the skippable half down by ~120 ms, to roughly **1.5×**).
+
+**That is not worth what it costs.** The bill is a relocation table threaded through the
+lowering core, an on-disk format with versioning and a schema fingerprint, a shift test, an API
+change to `def-compiler-sys`, and a class of bug this project should least tolerate:
+**under-invalidation is a silent wrong-output bug, and §6's own gate cannot see it** (a
+from-scratch build stays internally consistent, so corruption only appears on a later cache
+hit). Trading that risk for ~250 ms is a bad trade for a compiler whose correctness story is its
+main asset.
+
+**Do not build the cache.** The design below is kept because it is sound and because the
+compile/link split has *standalone* value — see A.4 — not because the cache is queued.
+
+#### A.3 Parsing — the plan
+
+Parsing is the largest remaining item: 152 ms of a ~650 ms build, plus 18 ms evaluating symbols.
+Measured with a counting allocator over the whole 238-file, 12.8 MB corpus:
+
+| | time | allocations | allocated | retained |
+|---|---|---|---|---|
+| read all 238 files | 17 ms | 468 | 28 MB | 12.8 MB (kept for diagnostics) |
+| lex → 1,120,975 tokens | 63 ms | 2,015 | 149 MB | — (transient per file) |
+| build the AST | 89 ms | ~1,272,000 | ~147 MB | **81.4 MB** |
+
+Two facts decide the ordering, and both cut against the obvious instinct:
+
+- **Lexing is compute-bound, not write-bound.** 12.8 MB in 63 ms is 203 MB/s — slow for a lexer.
+  The 54 MB token stream is only ~5 ms of writes at memory bandwidth, so **shrinking `Token` is
+  mostly a memory win, not a time win.** (The ~95 MB of doubling churn *above* that 54 MB is
+  real time — roughly 10 ms of `memcpy` — and is fixed by reserving capacity, not by shrinking.)
+- **AST construction is allocation-bound.** ~1.27 M allocations for 1.12 M tokens — about one
+  per token. ~430 k are identifier/number `String`s (the ≤8/≤16/≤32 B buckets); the rest are the
+  `Vec`s behind property paths, argument lists and bodies.
+
+##### Step 1 — parse files in parallel. Do this first, and alone
+
+**Measured: 154 ms → ~27 ms on 12 cores (5.5×)**, with plain `std::thread::scope` and naive
+static chunking. Better scaling than lowering ever managed (§A.7) because files are independent
+and numerous. This is worth more than every other step here combined, and it is the only one
+that touches no types.
+
+`parse_source(&text, FileId) -> Result<SourceAst, _>` is already pure: it reads a `&str` and a
+file id and returns a tree. Nothing is shared, nothing is interned, no diagnostics are pushed.
+The restructuring is entirely in `build.rs`:
+
+- **`load_symbols` (build.rs:706) currently interleaves parse and evaluate per header** — it
+  parses a header, then immediately calls `symbols.evaluate_items`. Split it: read and parse all
+  headers in parallel, then evaluate in the original order.
+  **`SymbolTable` is last-definition-wins (§4.1), so evaluation must stay sequential and in file
+  order.** This is the one real constraint in the whole step.
+- **`parse_corpus` (build.rs:825) already has the right shape** — it parses all `.def`/`.tpl`
+  files in one loop, then evaluates their declarations in a second loop. Only the first loop
+  moves.
+- **Source ids must be assigned before parsing**, since every span is stamped with one. They
+  already are (`let sid = sources.len()` precedes `parse_source`); with a parallel map they come
+  from the file's index in the sorted walk instead. Deterministic either way.
+- **Diagnostics must be pushed in file order**, not completion order. Collect
+  `Vec<Result<SourceAst, DefParseError>>` indexed by file, then walk it in order pushing errors.
+  `Diagnostics::take()` sorts by (file, offset) anyway, but the *ids* must not depend on
+  scheduling.
+- **Reading the files should move into the parallel phase too** (17 ms, mostly syscall latency).
+
+Use `std::thread::scope` — no new dependency, and the measured 5.5× already includes the naive
+split. Chunking by *file count* is unbalanced (sizes vary ~100×), so hand out work by index from
+an `AtomicUsize` or pre-sort chunks by file size; expect a little better than 5.5× and much less
+run-to-run variance.
+
+> **Gate: golden must stay green, byte-for-byte.** Parallel parsing changes no output. If it
+> does, the cause is an ordering assumption — almost certainly symbol evaluation or source-id
+> assignment — not a race in the parser.
+
+**Then stop and re-measure.** After this step parsing is ~30 ms of a ~520 ms build, and steps
+2–5 each shave single-digit milliseconds off a number that is no longer the bottleneck. They may
+not be worth doing at all on time grounds; steps 2–4 remain justified on *memory* and
+*simplicity* grounds, which is how they should be argued from that point on.
+
+##### Step 2 — `Span` as a global byte offset (24 bytes → 8)
+
+The redundancy is real: `lex(input, file)` stamps one `FileId` into all 1,120,975 token spans and
+the parser copies it into every AST node. That is ~4.5 MB of duplicated file id in the token
+stream and ~1.3 MB in the retained AST.
+
+But the file id cannot simply be dropped to a per-tree field. §4.1's rule is load-bearing: **a
+span outlives the context it was read in.** Lowering reads a template's statements while
+compiling a definition in a *different* file (that is what `Body::Chain` does), so a bare
+`{start, end}` would be ambiguous exactly when a diagnostic needs it most.
+
+**The fix that gets both: one global byte-offset space across the whole corpus** (the model
+rustc uses for `BytePos`). Each source file is assigned a disjoint range; a span is
+`{ lo: u32, hi: u32 }`; the file is recovered by binary-searching a table of file bases. The span
+stays self-identifying, and the id stops being stored 1.1 M times.
+
+- The corpus is 12.8 MB against `u32`'s 4 GB — ~300× headroom.
+- File lookup happens **only when rendering a diagnostic**, so the binary search is paid exactly
+  where cost does not matter.
+- `Span::contains` becomes plain range containment and the file check disappears — the comment
+  explaining why the check exists goes with it.
+
+Measured layouts (mock types, same alignment rules):
+
+| | `Span` | `Spanned<Statement>` | `Spanned<Expr>` | `Token` |
+|---|---|---|---|---|
+| today | 24 | 120 | 72 | 48 |
+| keep `FileId`, `u32` offsets | 12 | 112 | 64 | 32 |
+| **global `u32` offsets** | **8** | **104** | **56** | **32** |
+
+Note what alignment does here: **for `Token` the two options are identical** (both land on 32,
+because the `&str` forces 8-byte alignment), so the extra 4 bytes only pay off in the AST and
+in step 3. Across the ~323,747 `Spanned` nodes the corpus retains, keeping `FileId` saves
+2.59 MB and the global space saves 5.18 MB — of an 81.4 MB AST. **Call it a 6% AST reduction and
+a 33% token-stream reduction; do not expect a large time win on its own.** Its better
+justification is that it is a simplification, and that every later pass walks smaller nodes —
+lowering reads 681,479 statements through `Body::Chain`, so node size is cache behaviour.
+
+Change surface, which is small and mostly mechanical:
+
+| Where | What |
+|---|---|
+| `text/base.rs` | `Span { lo: u32, hi: u32 }`, `SYNTHETIC` becomes a reserved value (`lo == hi == u32::MAX`), `contains` loses the file check |
+| `text/lexer.rs` | `Lexer`/`lex` take a `base: u32` instead of `FileId`; ~6 `Span::new` sites |
+| `text/mod.rs` | `parse_source(input, base)`; ~12 `Span::new(cursor.file(), …)` sites |
+| `build.rs` | assign bases from file lengths before parsing (composes with step 1, which reads all files first); 2 sites turning `span.file.0` into `DiagnosticLabel.source` become a `SourceMap` lookup; 1 `Span::new(dspan.file, …)`; 1 `contains` |
+| `defc/main.rs`, `def-compiler-sys` | both render through `codespan-reporting` with a **per-file** range, so subtract the base: `span.lo - base(label.source)` |
+
+`SourceFile` gains a `base: u32`, and `BuildReport`/`BuildError` expose the table. `FileId`
+survives only as the index into that table — which is what `DiagnosticLabel.source` already is,
+so the two stop being redundant representations of the same thing.
+
+Anonymous parses (`parse_expr_str`, unit tests, `FileId::ANONYMOUS`) get a reserved high base
+whose lookup returns "no file", which renders location-less — the shape `BuildDiagnostic::bare`
+already has.
+
+##### Step 3 — shrink `Token` to 12 bytes (depends on step 2)
+
+`Token { kind: TokenKind, span: Span, source: &'a str }` is 48 bytes, of which `source` is 16 and
+is **redundant**: it is exactly `&input[span.lo - base .. span.hi - base]`. Drop it and have
+`Cursor` hold the input, and with step 2's 8-byte span a token is `1 + 8` → **12 bytes**, a
+quarter of today's. The token stream goes 54 MB → 13.5 MB.
+
+Pair it with **reserving the token `Vec`** from an estimate of `input.len()`, which removes the
+~95 MB of doubling churn — that one is worth ~10 ms and is a two-line change that can land
+independently of everything else.
+
+##### Step 4 — box `PathSegment::Index` (independent of 1–3)
+
+`PathSegment` is **72 bytes** because one of its two variants is a `Spanned<Expr>`; the common
+variant is `Field(String)` at 24. Every property path is a `Vec<PathSegment>` and most are one
+or two segments, so the corpus pays ~48 bytes of padding per segment. Boxing the `Index` variant
+takes `PathSegment` to 24 — **a larger AST saving than step 2**, in a much smaller change.
+Indexed segments are rare, so the extra indirection is not on the hot path.
+
+##### Step 5 — intern identifiers (conditional, last)
+
+517,988 identifier/number tokens across the corpus are only **108,349 distinct (4.8×
+repetition)**, 7.2 MB of text against 2.99 MB of distinct text. Interning removes ~430 k of the
+~1.27 M AST allocations.
+
+Two shapes were considered:
+
+- **`Symbol(u32)` into a table.** 4 bytes per name, and every name comparison becomes an integer
+  compare — which would speed up *lowering* too, since `DefReader` matches path segments against
+  `&'static str` field names on every lookup. Deepest change: AST field types, plus interning the
+  schema's names once at startup.
+- **Borrowing `&'a str` from the source text.** Zero allocations and zero interning, but it puts
+  a lifetime on `SourceAst`/`Definition`/`Statement`/`Expr`, which then infects `defs_by_name`,
+  `Body`, and every signature in `lower.rs`.
+
+**Neither is worth starting before step 1 is measured.** `&'static str` by leaking an interner
+arena is *not* an option here: `def-compiler-sys` is a cdylib that EgoCore calls repeatedly in a
+long-lived process, and a leak that grows per distinct corpus is a real defect there.
+
+##### Ordering, and what gates each step
+
+1. **Parallel parsing** — no type changes, ~127 ms, golden-gated. **Re-measure before step 2.**
+2. **Reserve the token `Vec`** — two lines, ~10 ms, independent of everything.
+3. **`Span` → global offsets** — mechanical but wide; the compiler finds every site. Justified on
+   memory and simplification, not on time.
+4. **Drop `Token.source`** — only after 3.
+5. **Box `PathSegment::Index`** — independent; best AST-memory-per-line-changed of the lot.
+6. **Interning** — only if a profile after 1–5 still shows AST construction on top.
+
+Every step here is byte-identical by construction, so **golden is an exact gate throughout**, as
+it was for Phase 1 (§A.1). Keep a known-good output directory and `cmp` all four binaries — the
+golden hash tells you *that* something moved, not *which* file.
+
+#### A.4 The compile/link split, if it is ever built
+
+**Its real value is parallelism and memory, not caching.** The shared
+`&RefCell<NamesBuilder>` is the only reason lowering must be sequential; per-def relocation
+tables remove it. Together with a link phase that works on byte buffers, that would take
+~107 ms of lowering plus the 102 ms of `EntryRecord` moves and make both parallel or unnecessary
+— **~180 ms, no cache involved.**
+
+It is also *far* safer to build for that purpose than for a cache: with lowering and linking in
+the same build, a missed relocation site changes the output immediately and **golden catches it
+exactly**. The shift test below exists only because a cache breaks that property.
 
 A lowered body is not position-independent. It carries two kinds of corpus-global state:
 
@@ -933,7 +1152,7 @@ corrupts on a cache hit after the index space moves. So Phase 2's acceptance tes
 
 This test is what makes the approach trustworthy, and **it must exist before any cache does.**
 
-#### A.3 Phase 3 — the cache
+#### A.5 The cache design — **not being built** (A.2), kept so it need not be re-derived
 
 Cache key, Merkle-chained rather than cascade-propagated:
 
@@ -997,52 +1216,50 @@ compiler handle in `def-compiler-sys`, and works identically for the `defc` CLI.
 corrupt, or foreign cache must only ever cost time, never correctness — the Merkle key plus the
 schema fingerprint make a mismatch a miss, and nothing else.
 
-##### What a warm rebuild still costs
+##### What a warm rebuild would still cost
 
-From the §1 components, with Phase 1 landed: index space 25 ms + serialize 15 ms + chunk 32 ms +
-zlib 35 ms + cache read ~10 ms ≈ **120 ms**, plus link and re-lowering whatever changed.
-**Parsing (165 ms) is then the single largest remaining item**, which inverts the old plan's
-"file-hash layer buys at most 10%, low priority" — it is Phase 3b, not an afterthought.
+See A.2 for the arithmetic that closed this out: ~0.37 s warm against a 0.65 s cold build,
+under 2×, shrinking toward 1.5× as A.3's parsing work lands. If the cache is ever revisited,
+**re-derive those two columns first** — they are what the decision turns on, and Phase 1 moved
+them by 6×.
 
-> **Be honest about the remaining prize.** Phase 1 took the build from 3.8 s to **0.65 s** with
-> no cache, no format change and no re-bless. What is left on the game.bin path is roughly
-> 177 ms parse · 82 ms lower named · 25 ms lower sub-defs · 102 ms moving bodies into
-> `EntryRecord` · 82 ms serialize + chunk + zlib.
->
-> A warm rebuild cannot go below the parts that must run every time — link, serialize, chunk,
-> zlib, plus the cache read — which is **~150 ms**, or ~330 ms if parsing is not cached. So the
-> cache buys roughly **2×**, or ~4× with a parse cache. Not the order of magnitude the original
-> "lowering is 88%" framing implied. **Phase 2 and 3 should be re-justified against these
-> numbers before the relocation work starts** — and note that a parse cache (Phase 3b) is
-> simpler than the relocation table and now worth more than lowering is. Whether a 0.65 s
-> rebuild is too slow for EgoCore's edit-compile loop is a product question, not a compiler one.
+Note also that a *parse* cache is a different and much smaller proposition than a def cache: one
+key per file, no relocation table, no index space to reconcile, and a miss costs a re-parse
+rather than a wrong def. If any caching is ever wanted, that is the one to build.
 
-#### A.4 Settled for this track
+#### A.6 Settled for this track
 
-- **Relocation table, not `LowerEnv`.** The trait was removed deliberately and should stay
-  removed; the seam that matters is what the two arguments *return* (table ids), not their type.
-- **Slot-carried table ids, not `(field crc, ordinal)` pairs.** No ordering invariant to hold.
-- **Literals get table entries**, so there is no tag bit and no sentinel range.
-- **Dedup sub-defs after linking**, on resolved bytes, as today.
-- **One lowering path**, always symbolic, always linked — no fast path for cache misses.
-- **Phase 1 before Phase 2.** The algorithmic fixes are a bigger win than the entire cache, and
-  they change the cache's cost/benefit enough that Phase 2 should not start until Phase 1's
-  numbers are real.
-- **`redb`, with `defc_build` taking a cache-file path.** Measured: ~7 ms/build more than a flat
-  image, in exchange for delta writes and crash safety.
-- **A cache miss must only ever cost time.** No cache state may change output bytes.
+- **No def cache** (A.2). Revisit only with fresh numbers, never on the old framing.
+- **Optimise before caching.** Every Phase 1 win was removable redundancy, and finding it
+  required per-phase measurement. A cache would have hidden all of it behind a warm path and
+  left the cold build at 3.8 s.
+- If the compile/link split is ever built (A.4): **relocation table, not `LowerEnv`** — the seam
+  that matters is what the two existing arguments *return*, not their type; **slot-carried table
+  ids, not `(field crc, ordinal)` pairs**, so there is no ordering invariant across §4.5's arms;
+  **literals get table entries**, so no tag bit and no sentinel range; **dedup sub-defs after
+  linking**, on resolved bytes, as today.
+- If any cache is ever built: **a miss must only ever cost time** — no cache state may change
+  output bytes — and **`redb` with a cache-file path argument**, measured at ~7 ms/build over a
+  flat image in exchange for delta writes.
 
-#### A.5 Not on the critical path
+#### A.7 Not on the critical path
 
 Measured and set aside, so nobody re-derives them:
 
-- **Parallel lowering** — 1.85× on 12 cores with static chunking, and a much smaller prize once
-  the O(F×S) scan is gone. Revisit only if a profile still shows lowering on top.
-- **AST allocation** — 95 ms of the 147 ms parse is AST construction rather than lexing (which
-  runs at 248 MB/s); every symbol and number literal becomes an owned `String`. Interning would
-  help both parse time and the AST hash in Phase 3. Not worth touching before Phase 1.
-- **Boxing `DefBody`'s large variants** — 5,080 B per value, 102 ms just moving bodies into
-  `EntryRecord`. Phase 2 removes most of the motivation by keeping link on byte buffers.
+- **Parallel lowering** — 1.85× on 12 cores with static chunking (against parsing's 5.5×), and
+  it needs the per-def `NamesBuilder` from A.4 to be correct at all. The `CREATURE` cluster
+  lands on one thread; work-stealing would do better.
+- **Boxing `DefBody`'s large variants** — 5,080 B per value, and **102 ms of the build is just
+  moving bodies into `EntryRecord`**. This is now the largest item after parsing and lowering,
+  and unlike A.4 it is a local change. Worth doing on its own.
+- **`size_of::<Span>() = 24`** — now A.3 step 2, where it belongs: it is not only a parsing
+  cost, since `Span` sits on every AST node the whole build holds.
+- **The retained AST is 81.4 MB** for a 12.8 MB corpus — 6.4× the source text. A.3 steps 2 and 4
+  take ~12 MB of that; the rest is `Statement` at 96 bytes and `Expr` at 48. Nothing has needed
+  it yet, but it is the number to check if memory ever becomes the complaint.
+- **`LineIndex` (`text/base.rs`) is dead code.** Both renderers resolve line/column through
+  `codespan-reporting` instead. Delete it, or use it — but it should not sit there implying
+  span→line resolution lives in `defs`.
 
 ### Track B — Diagnostics, remaining
 
