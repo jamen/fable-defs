@@ -8,7 +8,7 @@ use def_compiler::{BuildDiagnostic, Progress, Severity, SourceFile};
 /// Fable def compiler
 #[derive(argh::FromArgs)]
 struct Args {
-    /// input directory containing .def, .tpl, and .h files
+    /// input directory of .def, .tpl, and .h files
     #[argh(option, short = 'i')]
     source: Option<PathBuf>,
 
@@ -16,7 +16,7 @@ struct Args {
     #[argh(option, short = 'o')]
     output: Option<PathBuf>,
 
-    /// print version and exit
+    /// print version
     #[argh(switch)]
     version: bool,
 }
