@@ -63,17 +63,37 @@ cargo run -q -p defc -- $TEXT/Defs <out_dir>
 
 | | |
 |---|---|
-| Source files parsed | 177 (`.def`/`.tpl` + `.h`) |
+| Source files parsed | 177 `.def`/`.tpl` + 61 `.h` |
 | Definitions | 10,454 |
 | Output entries | game 13,239 · frontend 851 · script 611 |
 | game.bin composition | NULLDEFs + 9,264 named + 3,726 distinct anonymous sub-defs (33,525 lowered, deduped) |
-| **Total build** | **3.5 s** |
-| — parse, all files | 0.35 s (10%) |
-| — **lower + emit game.bin** | **3.09 s (88%)** |
-| — lower + emit frontend + script | 0.06 s (2%) |
+| **Total build** | **~0.95 s** (was 3.8 s before §9 Track A Phase 1) |
 
-Re-measure with the timing recipe in §10 before optimising anything; these numbers drive the
-incremental design in §9.
+**Per-phase, on the game.bin path** (~85% of the build; frontend + script are ~0.06 s). Measured
+by replaying the pipeline through the public API — see the recipe in §10. The replica's template
+filter is cruder than the real build's (8,838 vs 9,264 named), so these run ~5% under.
+
+| Phase | before | now |
+|---|---|---|
+| parse 61 headers + evaluate symbols | 49 | 50 |
+| parse 177 `.def`/`.tpl` | 138 | 137 |
+| index space (`collect_body_references` + `collect_named`) | 25 | 5 |
+| lower 249 NULLDEF bodies | 3 | 2 |
+| `flatten_specialization`, named pass | 390 | **394** ← the one left (fix 4) |
+| `flatten_specialization`, sub-def pass — a duplicate call | 345 | 0 |
+| lower ~9,264 named bodies | 291 | **97** |
+| tagged-block merge → 33,525 sub-def inputs | 46 | now borrowed, not cloned |
+| lower 33,525 sub-def bodies (→ 3,726 distinct) | 269 | **~25** (memoized) |
+| move bodies into `EntryRecord` | 102 | 102 |
+| serialize ~12.5k entries (6.8 MB) | 15 | 15 |
+| **chunk split** | **1,804** | **32** |
+| zlib, 434 chunks | 35 | 35 |
+
+> **The old headline "lower + emit game.bin = 88%" was an artefact of the measurement**, which
+> timed the gap between two progress lines and attributed all of it to lowering. Lowering was
+> 15%, and nearly half the build was an accidental quadratic in the chunk split. Everything
+> removed so far was **redundant work, not necessary work** — the output has been byte-identical
+> at every step. Re-measure before optimising anything; these numbers drive §9.
 
 ---
 
@@ -376,8 +396,14 @@ manifest slices, and the game-only sub-def region):
    content-derived.
 6. **Chunking**: greedy split at 16 KB decompressed, zlib level 1 (`78 01`).
 
-> `flatten_specialization` currently runs **twice per definition** — once in
-> `emit_nulldef_and_named`, once in `build_subdefs`. Cheap win available (§9).
+> **Load-bearing ordering in this pass.** `build_subdefs` must run after *every* named entry
+> exists: sub-def entries follow the named ones in the global index space and in the continuous
+> `ClassIndex` counters, and their tags are interned into `names.bin` after every named def's
+> strings. That is why the named pass resolves each specialization chain and hands the merged
+> tagged blocks forward (`SubDefBlocks`, borrowed from the ASTs) instead of `build_subdefs`
+> re-deriving them — and why sub-def *lowering* cannot simply be interleaved into the named loop
+> without changing `names.bin`. Phase 2's symbolic strings (§9) are what would lift that
+> constraint.
 
 ### 4.7 Binary container layer (`defs/src/binary.rs`)
 
@@ -636,99 +662,347 @@ map onto the hand-rolled reflection) but deferred — it's 0.1.x/experimental.
 
 ### Track A — Incremental compilation (next major work)
 
-**Goal:** a `redb`-backed cache so an edit-compile cycle costs time proportional to what
-changed, not to the size of the corpus.
+**Goal:** an edit-compile cycle costs time proportional to what changed, not to the size of the
+corpus.
 
-#### What the measurements say
+Three phases, in order. **Phase 1 is not a warm-up for the cache — it is the larger win.**
 
-From §1: **lowering + emitting game.bin is 88% of a 3.5 s build; parsing all 177 files is
-10%.** So:
+#### A.0 Where the time actually goes
 
-- **Cache lowered definitions, not parsed files.** A file-hash layer that skips *parsing* buys
-  at most 10%, and only when no file changed. Worth having eventually as a cheap second layer,
-  but it is not where the time is. **Def-centric is the right instinct.**
-- Within game.bin, 33,525 sub-defs are lowered against 9,264 named defs. Sub-def lowering is
-  likely the larger half; measure before optimising.
+The old claim was that lowering is 88% of the build. It is 15%. The build has **three
+independent algorithmic problems, none of which a cache fixes**:
 
-#### The invalidation graph
-
-Measured on the corpus:
-
-| | |
+| Problem | Cost |
 |---|---|
-| Definitions | 10,454 (7,172 have a parent) |
-| Chain depth | max 8, median 1 |
-| **Leaf definitions (0 descendants)** | **9,775 (93.5%)** |
-| Definitions with ≥100 transitive descendants | 23 |
-| Largest | `OBJECT_BASE` 3,147 · `OBJECT_VILLAGE_SOLID_FURNITURE_BASE_TEMPLATE` 1,716 · `CREATURE_BASE_TEMPLATE` 523 |
+| Chunk split is O(n²) over a 5,152-byte record | **1,804 ms** (measured; 32 ms fixed) |
+| `lower_generic` is O(fields × statements) | **~180 ms** of the 272 ms named lowering |
+| `flatten_specialization` clones 681k statements — and runs twice | **735 ms** |
 
-The distribution is bimodal and favourable: **93.5% of definitions are leaves**, so the typical
-modder edit invalidates exactly one def. A root-template edit invalidates up to 30% of the
-corpus, which is a correctness requirement, not a performance problem — it just has to be
-*correct*, never under-invalidating.
+Finer decomposition of the game.bin path, with text pre-read so parse timings exclude I/O:
 
-Cascade rule: editing a def invalidates itself and **all transitive descendants**. Tagged
-blocks merge across the chain too, so sub-def outputs cascade identically.
+| | ms |
+|---|---|
+| lex, all 238 files (12.8 MB) | 52 (248 MB/s) |
+| AST construction on top of lex | 95 |
+| evaluate header symbols | 18 |
+| index space | 25 |
+| flatten, one pass | 361 |
+| lower 9,264 named bodies | 272 |
+| lower 33,525 sub-def bodies | 184 |
+| serialize 12.5k entries (6.8 MB) | 15 |
+| chunk split | 1,804 |
+| zlib, 434 chunks | 35 |
 
-#### The hard part: cached bodies are not position-independent
+**Lowering's cost is not in the bespoke logic.** Grouped by def type, 94% of the 272 ms lands in
+types that have bespoke arms — but every one of those arms calls `lower_generic` internally, so
+that says the expensive types have big bodies, not that the bespoke code is slow:
 
-This is the thing that will sink a naive implementation. A lowered `DefBody` contains two kinds
-of corpus-global state:
+| type | `#[def]` fields | stmts/def | µs/def |
+|---|---|---|---|
+| `CREATURE` | 89 | 132 | 275 |
+| `OBJECT` | 44 | 31 | 20 |
+| `UI` | 110 | 15 | 9 |
+| `PLAYER_GUI` | — | 1,625 | 3,865 |
 
-1. **`DefIndex` = a global entry index**, assigned by position in `collect_named`, which
-   depends on the whole corpus and on file order. Adding or removing *any* earlier def shifts
-   every later index, invalidating every cached body that references one.
-2. **`DefString` = a byte offset into the shared `names.bin`**, which depends on interning
-   order across the entire build.
+**Direct test of the cause** — pad a def's body with statements whose field name matches nothing
+in the schema (pure no-op work) and time it:
 
-So a cached body must keep references **symbolic** (by name / by string) and resolve them at
-link time. The pipeline once had exactly this seam — a `LowerEnv` trait with `def_index(name)`
-+ `def_string_offset(str)` — and **it no longer exists**: `lower_def` now takes
-`def_indices: &HashMap<String,u32>` and `names: &RefCell<NamesBuilder>` directly.
-**Restoring that seam is a prerequisite**, not an optimisation.
+```
+OBJECT     28 stmts → 14.1 µs      CREATURE   41 stmts → 36.7 µs
+          164 stmts → 50.9 µs                113 stmts → 55.4 µs
+```
 
-That gives the compile/link split: *compile* a def to a body with symbolic references (cacheable,
-position-independent), then *link* — assign indices, intern strings, patch, serialize.
+Linear, at **~0.27 µs per statement that matches nothing**. `DefReader::find_opt_leaf`
+(`reader.rs:495`) scans every unconsumed entry on every field lookup and cannot early-exit
+because the semantics are last-wins — so a def costs `fields × statements` string comparisons.
+Over 681,479 flattened statements that is **roughly 180 ms of the 272 ms**, and a proportional
+share of the sub-def 184 ms.
 
-#### What to hash
+Sub-def lowering is additionally **5.6× redundant at the input**: 33,525 lowerings from ~5,700
+distinct `(tag, statement-list)` inputs (they dedup to 3,726 distinct *outputs*).
 
-Hash the **statement list after flattening is excluded** — i.e. the def's own body — plus its
-type and parent name. Then cascade. Options for the hash input:
+#### A.1 Phase 1 — the algorithmic fixes (no cache, byte-identical, golden-gated)
 
-- **Text source of the def.** Simple and obviously correct, but trivia-sensitive: reformatting
-  or a comment edit invalidates. Given the corpus is CRLF and heavily commented, this will
-  cause spurious rebuilds.
-- **The AST.** Skips trivia by construction. Requires a stable, span-*excluding* hash — spans
-  change when anything above them in the file moves, so hashing them defeats the purpose.
-  `Spanned<T>: PartialEq` already ignores spans, so the precedent exists; a `Hash` impl must do
-  the same.
+**Status: done except fix 4. Build is 3.8 s → 0.95 s, output byte-identical throughout.**
 
-Recommend the AST hash, with the span-exclusion property covered by a test that inserts a
-comment and asserts the hash is unchanged.
+Every one of these turned out to be *the same bug in four places*: work proportional to the
+whole corpus being redone or re-copied per definition.
 
-Correctness obligations, in priority order — **under-invalidation is a silent wrong-output
-bug, over-invalidation only costs time**:
+| # | Fix | Result |
+|---|---|---|
+| 1 ✅ | **Chunk split.** `assemble_and_write` looped `remaining.drain(..split)`, memmoving the tail of a `Vec<EntryRecord>` (5,152 B each) once per chunk. Precompute sizes, find boundaries, consume in one forward pass. | **1,804 → 32 ms** (3.8 → 1.6 s) |
+| 3 ✅ | **`flatten_specialization` ran twice per def.** Split into `specialization_chain` + `flatten_chain`; the named pass resolves the chain once and collects the merged tagged blocks off it, **borrowed** from the ASTs. | **1.6 → 1.43 s** |
+| 2 ✅ | **`strip_superseded_by_clear` deep-cloned every body.** It returned `body.to_vec()` when there was nothing to strip, which is nearly always — 681k statement clones. Return `Cow`. | lowering **275 → 96 ms** (1.43 → 1.15 s) |
+| 5 ✅ | **Sub-def lowering memoized on its input.** Borrowed blocks make `(tag, [(ptr, len)])` an exact key; inheriting the same block from a template is the whole redundancy. | **1.15 → 0.95 s** |
+| 4 ⬜ | **Stop materializing the flattened body.** Still the largest single item at **~390 ms**. | not started |
 
-- The symbol table is global and two-pass (all headers + all `.def`-local declarations are
-  evaluated before any lowering). Any symbol change potentially affects any def that reads it.
-  Either track per-def symbol reads or treat a symbol-table change as a full invalidation to
-  start with.
-- Duplicate definition names: first occurrence wins the index, last wins the body (§4.6). The
-  cache key must be the *resolved* def, not the file-local one.
-- The manifest, the schema (`defs` crate), and the compiler version all affect output. Bake a
-  version stamp into the cache key so a code change can't serve stale bodies.
+> **Fix 2 is not the fix that was planned, and the planned one was wrong.** The prediction was
+> that `DefReader`'s by-name accessors — which scan the whole body per lookup, several times per
+> field — were the ~180 ms. A name index was built and measured: it does remove the slope
+> (0.134 → 0.036 µs per statement) but its `HashMap` build cost cancels the gain at this
+> corpus's body sizes, showing **no difference at any threshold (16/64/128/off)**. It was
+> reverted — `DefReader` is the semantic core and does not get complexity that does not pay.
+> The `O(fields × statements)` scan is real; its constant is just small. The 0.27 µs/statement
+> the padding probe measured was mostly the *clone*, not the scan. Revisit the index only if a
+> corpus with much larger bodies appears.
 
-#### Suggested sequence
+**Fix 4, the remaining one.** 97,342 own statements become 681,479 after flattening (7.0×
+fan-out) at ~530 ns each — purely to be *borrowed*, since `DefReader::new` stores
+`&Spanned<Statement>` and never the values. Feed it the chain as a list of slices instead.
+`DefReader` itself is easy (a `from_slices` constructor); the work is that `body: &[Spanned<Statement>]`
+threads through all of `lower.rs`, and `strip_superseded_by_clear`, `partition_method_calls`,
+`filter_out_fields` and `build_thing_components` each build filtered `Vec`s from it. It wants a
+small `Body<'a>` type wrapping `&[&[Spanned<Statement>]]`. This is a real refactor — worth doing,
+but it is the one step here that is not local.
 
-1. Restore the `LowerEnv` seam; make lowered bodies reference-symbolic. Golden-gated, no cache
-   yet, no behaviour change.
-2. Measure named vs sub-def lowering split to confirm where the 3.09 s goes.
-3. Build the specialization graph explicitly (it is currently rediscovered by walking
-   `specializes` on demand) and use it for both flattening and cascade.
-4. Add the AST hash + `redb` store, keyed on def name, valued by (hash, symbolic body).
-5. Only then consider the file-hash layer to skip parsing.
+Cross-cutting, still open: `size_of::<DefBody>() = 5,080 B` is why moving bodies into
+`EntryRecord` costs 102 ms and why fix 1 was so dramatic. Boxing the large variants shrinks the
+constant everywhere; Phase 2 removes most of the need by keeping the link phase on byte buffers.
 
-Free win available immediately: `flatten_specialization` runs **twice per def** (§4.6).
+##### Executing Phase 1
+
+**Every step is byte-identical by construction, so golden is an exact gate, not an
+approximation.** This is the whole reason to do Phase 1 before Phase 2: no output changes, so a
+red golden means the step is wrong — never re-bless during Phase 1, and never batch two steps
+into one commit. Run after each:
+
+```bash
+OA_TEXT_DIR=$TEXT/Defs cargo test -p defc --test golden
+time ./target/release/defc -i $TEXT/Defs -o /tmp/out    # after cargo build --release -p defc
+```
+
+**`cargo test -p defc --test golden` is not enough on its own** — it hashes the four outputs
+against a blessed baseline, so it catches a change but does not tell you *which* file moved.
+Keep a known-good output directory and `cmp` all four; that is how each of these was verified.
+
+Two things this pass taught that generalise:
+
+- **Suspect copying before suspecting algorithms.** Three of the four wins were a `Vec` or
+  statement-list being duplicated per definition, not a loop with bad complexity. The one that
+  *was* a genuine complexity bug (the chunk split) was invisible in profile-by-inspection
+  because the expensive operation is a `memmove` inside `Vec::drain`, attributed to nothing.
+- **Verify the diagnosis before building the fix.** The planned fix 2 was designed off a
+  micro-benchmark showing 0.27 µs per no-op statement, which was read as "the by-name scan".
+  Most of it was the clone. Padding-probe slopes tell you cost *scales* with body size; they do
+  not tell you *what* scales.
+
+Still worth doing when someone touches `DefReader` for other reasons: a name index makes
+"which statements did nobody claim" cheap, which is what Track B's unconsumed-statement warnings
+need — though the build-scoped consumption ledger that work actually requires is separate.
+
+#### A.2 Phase 2 — the compile/link split
+
+A lowered body is not position-independent. It carries two kinds of corpus-global state:
+
+1. **`DefIndex` = a global entry index**, assigned by position in `collect_named`. Adding or
+   removing any earlier def shifts every later index.
+2. **`DefString` = a byte offset into the shared `names.bin`**, which depends on interning order
+   across the entire build.
+
+So a cached body must keep references **symbolic** and resolve them at link time.
+
+> **You cannot recover the symbolic form after the fact.** The tempting shortcut — lower as
+> today, then reverse-map index→name and offset→string — is unsound. `resolve_ref` /
+> `resolve_ref_i32` (`lower.rs:413`/`441`) fall back to the `Evaluator`, so a `DefIndex` slot
+> legitimately holds a plain evaluated number: a header symbol's value, or one of the hashed
+> text ids in the mis-typed reference fields (§10). A literal `1881` is indistinguishable from
+> "entry 1881", and relocating it corrupts the def. Same on the string side — `lower_ui` stores
+> `DefString(eval.eval_i32(expr)?)` for the polymorphic `Font`. **References must be recorded
+> where they are resolved.**
+
+##### The design: table-id slots
+
+Every `DefIndex`/`DefString` slot in a lowered body holds **an index into that def's own
+relocation table**, never a final value:
+
+```rust
+enum Reloc { Def(String), Str(String), Lit(i32) }
+
+struct Lowered {
+    body:  Vec<u8>,          // serialized; every reference slot holds a table id
+    slots: Vec<(u32, u32)>,  // (byte offset in `body`, table id)
+    table: Vec<Reloc>,       // ids assigned in first-encounter order
+}
+```
+
+Three properties make this work where the obvious "list of `(field crc, symbolic value)` pairs
+consumed in order" does not:
+
+- **The id travels in the slot**, so there is no ordering invariant between the relocation list
+  and container elements. Last-wins overwrites, `Field.clear()`, and the ~35 bespoke arms that
+  build vectors and maps by hand are all automatically correct. An ordering invariant across
+  those arms is the thing most likely to break silently; this removes it entirely.
+- **Literals get table entries too** (`Lit`), so a slot value is *always* a table id — no tag
+  bit, no reserved sentinel range, no chance of a literal colliding with an id.
+- **A missed recording site is detectable.** Valid ids are dense `0..table.len()` (tens of
+  entries), so a raw resolved index left in a slot is out of range and trips an assertion.
+
+Mechanics — this is a change to *what the two existing arguments are*, not a new parameter
+threaded through 35 arms:
+
+- `names: &RefCell<NamesBuilder>` → a per-def interner with the same `intern(&str) -> u32`
+  shape, returning a table id. The **11 `intern()` call sites in `lower.rs` are untouched.**
+- `def_indices: &HashMap<String, u32>` → a resolver that still consults the real name set (so
+  `UnresolvedReference` diagnostics are unchanged) but returns a table id. **5 lookup sites**,
+  all inside `resolve_ref`, `resolve_ref_i32`, and `apply_ui_state`.
+- Cloning the NULLDEF base seeds the child's table with a copy of the base's table, so ids in
+  the cloned body stay valid. NULLDEF bodies *do* carry relocations — `lower_ui` seeds
+  `ENG_ARIAL_16`.
+- Byte offsets come from a generated `visit_reloc_offsets` in `defs-derive` — the same
+  traversal `wire_size` already performs, emitting the running offset at each `DefIndex` /
+  `DefString`. Generated from the same field list, so it cannot drift from `serialize`. Cost is
+  `byte_size`-shaped: 0.8 ms for 12,486 entries.
+
+Link, per entry in global index order:
+
+```
+intern def_type and file name                (unchanged)
+resolve table entries in id order            ← replays today's intern order exactly
+out = body.clone();  for (off, id) in slots: out[off..off+4] = resolved[id]
+```
+
+**Why this stays byte-identical.** Table ids are assigned in first-encounter order, which *is*
+the order lowering calls `intern()` today; link replays them in id order, per def, in global
+index order — the same sequence of `NamesBuilder::intern` calls the current build makes. Golden
+is the check, and it is exact.
+
+Three consequences worth having on their own:
+
+- **Every relocation is 4 bytes, so a cached body's `byte_size` is constant.** Chunk splitting
+  needs no `DefBody` at all; the whole link phase runs on byte buffers, and the 5 KB `DefBody`
+  never has to be moved into an `EntryRecord`.
+- **There is one lowering path.** From-scratch builds go lower → symbolic → link exactly like
+  cache hits, so golden covers the link phase and there is no second path to drift. Do *not*
+  add a "cache miss ⇒ lower directly and emit" shortcut.
+- **Lowering becomes parallelisable.** The shared `&RefCell<NamesBuilder>` is the only thing
+  making it sequential today; per-def relocation tables remove it. Measured feasibility (each
+  thread lowering a disjoint slice with its own builder): 285 ms → 154 ms, only **1.85× on 12
+  cores** — the static chunking puts the whole `CREATURE` cluster on one thread. Work-stealing
+  would do better, but note that after Phase 1 fix 2 lowering is small enough that this is a
+  minor lever. Do not reach for threads before fixing the O(F×S) scan.
+
+**Sub-def dedup must stay on *linked* bytes.** Today's key is `(tag, resolved bytes)`, so a
+`Lit(5)` sub-def and a `Def(X)`-resolving-to-5 sub-def dedup together. Deduping on symbolic
+form would split them, add an entry, and shift every later index. Order stays: link sub-defs →
+dedup → assign indices.
+
+##### The gate: the shift test
+
+**A missed relocation site is invisible to golden.** A from-scratch build is internally
+consistent, so a slot that kept a raw resolved value still serializes correct bytes; it only
+corrupts on a cache hit after the index space moves. So Phase 2's acceptance test is:
+
+> Build corpus `C`. Build corpus `C′` — `C` plus one definition inserted at the front of the
+> first file (shifting every index) and one new string. Link `C′` from `C`'s cached bodies and
+> assert the result is byte-identical to a from-scratch build of `C′`.
+
+This test is what makes the approach trustworthy, and **it must exist before any cache does.**
+
+#### A.3 Phase 3 — the cache
+
+Cache key, Merkle-chained rather than cascade-propagated:
+
+```
+key(def) = H(schema_fingerprint, symbols_hash, def_type, is_template,
+             ast_hash(own body), key(parent))
+```
+
+Folding the parent's key in makes **cascade invalidation automatic** — editing `OBJECT_BASE`
+changes the key of all 3,147 descendants with no reverse-edge graph and no way to
+under-invalidate. Memoize over the chain (max depth 8, median 1) in topological order.
+
+- **`ast_hash` must exclude spans.** Spans move whenever anything above them in the file moves.
+  `Spanned<T>: PartialEq` already ignores them; `Hash` must match. Test: insert a comment,
+  assert the hash is unchanged.
+- **`schema_fingerprint` = hash of all 249 NULLDEF bodies plus their relocation tables**,
+  computed at runtime (`build_nulldefs`, 2.9 ms). Any field-order, type, or default change moves
+  it automatically. Prefer this to a hand-bumped `schema_version`, which only works if nobody
+  ever forgets.
+- **`symbols_hash` is global**: any header edit invalidates everything. Correct and cheap to
+  start with; per-def symbol-read sets are the refinement, not the starting point.
+- Value: the def's `Lowered`, plus its sub-def blocks in the same form. Because the value is
+  fully symbolic, **one cache entry serves all three binaries** — a def's lowering no longer
+  depends on which index space it lands in.
+- **Duplicate definition names** (§4.6, ~800 of them): first occurrence wins the index, last
+  wins the body. The key must hash the *resolved* definition (`defs_by_name`, last-wins), not
+  the file-local one.
+
+The invalidation graph is favourable: 9,775 of 10,454 definitions (93.5%) are leaves, so the
+typical edit invalidates exactly one def. 23 defs have ≥100 transitive descendants
+(`OBJECT_BASE` 3,147 · `OBJECT_VILLAGE_SOLID_FURNITURE_BASE_TEMPLATE` 1,716 ·
+`CREATURE_BASE_TEMPLATE` 523); a root-template edit invalidating 30% of the corpus is a
+correctness requirement, not a performance problem. **Under-invalidation is a silent
+wrong-output bug; over-invalidation only costs time.**
+
+##### Store: redb, and why the overhead does not matter
+
+The access pattern is unusual for a database: **the hot path reads every entry**, because link
+has to touch every entry whether or not it changed. That is a file-load workload, not a
+point-lookup workload, so it was worth checking that a B-tree store does not tax it. Benchmarked
+on 14,700 entries / 9.5 MB payload with a size distribution modelled on the measured bodies:
+
+| | redb 4.1 | flat single-file image |
+|---|---|---|
+| open | 0.8 ms | — |
+| **read every entry** | **7–8 ms** | 1.3 ms read + 1.0 ms index |
+| cold populate + commit | 89 ms (63 ms at `Durability::None`) | 17 ms |
+| write back 1 changed entry | 6 ms | 17 ms (full rewrite) |
+| write back 3,147 (an `OBJECT_BASE` edit) | 18 ms | 17 ms (full rewrite) |
+| on-disk size | 16.85 MB | 9.62 MB |
+
+**redb costs ~7 ms more per hot build and saves the full-image rewrite on every write.** Against
+a hot build in the hundreds of milliseconds that is noise, so pick on properties, not speed:
+redb gives crash-safe incremental writes and a single file; the flat image is smaller and has no
+dependency but rewrites everything on any change. **Go with redb.** Use `Durability::None` for
+the populate path — it is a cache, and the correct response to a torn write is a cold rebuild.
+
+The API shape is settled: **`defc_build` takes a cache-file path.** Absent or unopenable ⇒ cold
+build, populate it. Present and valid ⇒ hot build. This keeps `defc_build` one-shot, needs no
+compiler handle in `def-compiler-sys`, and works identically for the `defc` CLI. A stale,
+corrupt, or foreign cache must only ever cost time, never correctness — the Merkle key plus the
+schema fingerprint make a mismatch a miss, and nothing else.
+
+##### What a warm rebuild still costs
+
+From the §1 components, with Phase 1 landed: index space 25 ms + serialize 15 ms + chunk 32 ms +
+zlib 35 ms + cache read ~10 ms ≈ **120 ms**, plus link and re-lowering whatever changed.
+**Parsing (165 ms) is then the single largest remaining item**, which inverts the old plan's
+"file-hash layer buys at most 10%, low priority" — it is Phase 3b, not an afterthought.
+
+> **Be honest about the remaining prize.** Phase 1 has already taken the build from 3.8 s to
+> **0.95 s**, and fix 4 should land it near 0.6 s — with no cache, no format change and no
+> re-bless. Against that baseline the cache buys roughly **2×** (~0.3 s warm), or ~4× once
+> parsing is cached too — not the order of magnitude the original "lowering is 88%" framing
+> implied. **Phase 2 and 3 should be re-justified against these numbers before the relocation
+> work starts.** The cache is worth building if a sub-second rebuild is still too slow for
+> EgoCore's edit-compile loop; that is a product question, not a compiler one.
+
+#### A.4 Settled for this track
+
+- **Relocation table, not `LowerEnv`.** The trait was removed deliberately and should stay
+  removed; the seam that matters is what the two arguments *return* (table ids), not their type.
+- **Slot-carried table ids, not `(field crc, ordinal)` pairs.** No ordering invariant to hold.
+- **Literals get table entries**, so there is no tag bit and no sentinel range.
+- **Dedup sub-defs after linking**, on resolved bytes, as today.
+- **One lowering path**, always symbolic, always linked — no fast path for cache misses.
+- **Phase 1 before Phase 2.** The algorithmic fixes are a bigger win than the entire cache, and
+  they change the cache's cost/benefit enough that Phase 2 should not start until Phase 1's
+  numbers are real.
+- **`redb`, with `defc_build` taking a cache-file path.** Measured: ~7 ms/build more than a flat
+  image, in exchange for delta writes and crash safety.
+- **A cache miss must only ever cost time.** No cache state may change output bytes.
+
+#### A.5 Not on the critical path
+
+Measured and set aside, so nobody re-derives them:
+
+- **Parallel lowering** — 1.85× on 12 cores with static chunking, and a much smaller prize once
+  the O(F×S) scan is gone. Revisit only if a profile still shows lowering on top.
+- **AST allocation** — 95 ms of the 147 ms parse is AST construction rather than lexing (which
+  runs at 248 MB/s); every symbol and number literal becomes an owned `String`. Interning would
+  help both parse time and the AST hash in Phase 3. Not worth touching before Phase 1.
+- **Boxing `DefBody`'s large variants** — 5,080 B per value, 102 ms just moving bodies into
+  `EntryRecord`. Phase 2 removes most of the motivation by keeping link on byte buffers.
 
 ### Track B — Diagnostics, remaining
 
@@ -798,12 +1072,19 @@ cargo run -q -p def-compiler --example probe_counter_diff -- <dir> $REF
 # example older notes referred to lived in the pre-extraction OpenAlbion monorepo
 # and did not come across. See §7.
 
-# Phase timing (§1) — release build, timestamped progress lines
+# Total build time
 cargo build -q --release -p defc
-./target/release/defc $TEXT/Defs /tmp/out 2>&1 \
-  | while IFS= read -r l; do printf '%s\t%s\n' "$(date +%s.%3N)" "$l"; done \
-  | awk -F'\t' 'NR==1{t0=$1} /compiling/{tc=$1} /game:/{tg=$1} /script:/{ts=$1} END{
-      printf "parse %.2fs  game %.2fs  fe+script %.2fs\n", tc-t0, tg-tc, ts-tg }'
+time ./target/release/defc -i $TEXT/Defs -o /tmp/out
+
+# Per-phase timing (§1). There is no phase instrumentation in the library, and the
+# progress lines are too coarse to attribute cost — timing the gap between
+# "compiling" and "game:" lumps flatten, lower, serialize, chunk and zlib together,
+# which is exactly how "lowering is 88% of the build" got into this document when
+# lowering is 15%. Measure by replaying the pipeline through the public API in a
+# throwaway `packages/def-compiler/tests/` harness instead: `lower_def`,
+# `flatten_specialization`, `manifest::*`, `parse_source`, `SymbolTable`,
+# `NamesBuilder`, `Chunk`/`DefBinary` are all public, so the game.bin path can be
+# rebuilt phase by phase with an `Instant` between each. Delete it afterwards.
 
 # In-game test — deploy all four; ROLLBACK from $REF if it won't load
 cp <out_dir>/{game,frontend,script,names}.bin ~/Fable/data/CompiledDefs/
