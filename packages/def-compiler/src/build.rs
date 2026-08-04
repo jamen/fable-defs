@@ -31,8 +31,8 @@ use defs::binary::{
 use defs::crc32;
 use defs::names::NamesBuilder;
 use defs::text::{
-    DefFile, DefParseError, Definition, Expr, Span, Spanned, Statement, SymbolTable,
-    TextParseErrorKind, header::parse_header_file, parse_def_file, symbols::Redefinition,
+    DefParseError, Definition, Expr, SourceAst, Span, Spanned, Statement, SymbolTable,
+    TextParseErrorKind, parse_source, symbols::Redefinition,
 };
 
 use crate::lower::{LowerError, flatten_specialization, lower_def};
@@ -368,7 +368,7 @@ fn collect_body_references(
     let mut refs = HashSet::new();
     let mut visited = HashSet::new();
     for pf in files {
-        for d in &pf.def_file.definitions {
+        for d in pf.def_file.definitions() {
             walk_specialization_chain(&d.value, defs_by_name, &mut refs, &mut visited);
         }
     }
@@ -401,7 +401,7 @@ struct ParsedCorpus {
 struct ParsedFile {
     /// Normalized (`/`-separated) path; also the `sources` entry's path.
     path: String,
-    def_file: DefFile,
+    def_file: SourceAst,
 }
 
 /// Per-binary configuration: everything that distinguishes game.bin from
@@ -643,8 +643,8 @@ fn load_symbols(
             text,
         });
         let text = &sources[sid].text;
-        match parse_header_file(text) {
-            Ok(hd) => match symbols.evaluate(&hd) {
+        match parse_source(text) {
+            Ok(ast) => match symbols.evaluate_items(&ast.items) {
                 Ok(redefined) => report_redefinitions(&display, &redefined, diagnostics),
                 Err(e) => diagnostics.push(BuildDiagnostic::bare(
                     Severity::Error,
@@ -738,16 +738,16 @@ fn parse_corpus(
         let raw = std::fs::read(p).map_err(|e| format!("read {p:?}: {e}"))?;
         let text = String::from_utf8_lossy(&raw).into_owned();
         let path = normalize_path(p);
-        match parse_def_file(&text) {
+        match parse_source(&text) {
             Ok(f) => {
-                let def_count = f.definitions.len();
+                let def_count = f.definitions().count();
                 let sid = sources.len();
                 sources.push(SourceFile {
                     path: path.clone(),
                     text,
                 });
                 source_ids.push(sid);
-                for d in &f.definitions {
+                for d in f.definitions() {
                     def_to_source.insert(d.value.name.clone(), sid);
                     def_spans.insert(d.value.name.clone(), d.span);
                 }
@@ -780,7 +780,7 @@ fn parse_corpus(
     }
 
     for (&sid, pf) in source_ids.iter().zip(parsed_files.iter()) {
-        match symbols.evaluate_items(&pf.def_file.headers) {
+        match symbols.evaluate_items(&pf.def_file.items) {
             Ok(redefined) => report_redefinitions(&sources[sid].path, &redefined, diagnostics),
             Err(e) => diagnostics.push(BuildDiagnostic {
                 severity: Severity::Error,
@@ -908,7 +908,7 @@ fn collect_named(
     let mut named_order: Vec<String> = Vec::new();
     let mut named_indices: HashMap<String, u32> = HashMap::new();
     for pf in files {
-        for d in &pf.def_file.definitions {
+        for d in pf.def_file.definitions() {
             if named_indices.contains_key(d.value.name.as_str()) {
                 continue;
             }
@@ -1298,7 +1298,7 @@ fn build_one_bin(
     // Build the name→definition map from scoped files (last-wins by file order).
     let mut defs_by_name: HashMap<&str, &Definition> = HashMap::new();
     for pf in &scoped {
-        for d in &pf.def_file.definitions {
+        for d in pf.def_file.definitions() {
             defs_by_name.insert(d.value.name.as_str(), &d.value);
         }
     }

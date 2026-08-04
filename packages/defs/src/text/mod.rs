@@ -1,5 +1,4 @@
 pub mod base;
-pub mod header;
 pub mod lexer;
 pub mod symbols;
 
@@ -8,18 +7,71 @@ pub use self::lexer::{LexError, LexErrorKind, Lexer, TextParseErrorKind, Token, 
 pub use self::symbols::SymbolTable;
 
 use self::base::ParseError;
-use self::header::HeaderItem;
 use self::lexer::{Cursor, lex_error_to_parse_error};
 use std::collections::HashMap;
+/// One top-level construct. Both `.def`/`.tpl` and `.h` files are sequences of
+/// these — the split between "def grammar" and "header grammar" is
+/// conventional, not structural.
+///
+/// The corpus proves it: `engine_local_detail.def` declares two `enum`s whose
+/// 31 symbols appear in no header and are referenced ~1,800 times, so a `.def`
+/// legitimately carries declarations. Nothing in a `.h` carries definitions
+/// today, but nothing rules it out either.
+#[derive(Debug, Clone)]
+pub enum Item {
+    Definition(Spanned<Definition>),
+    Enum(EnumDecl),
+    Define(Define),
+    Namespace(Namespace),
+    /// `#ifdef` / `#ifndef` … `#else` … `#endif`.
+    Conditional(IfDef),
+    /// `#pragma once`. Kept as an item rather than silently skipped so the
+    /// top-level loop has no "recognized but discarded" category; it
+    /// contributes no symbols.
+    PragmaOnce(Span),
+}
+
+/// A parsed source file: `.def`, `.tpl`, or `.h`.
 #[derive(Debug, Clone, Default)]
-pub struct DefFile {
-    pub definitions: Vec<Spanned<Definition>>,
-    pub by_name: HashMap<String, usize>,
-    /// File-local `enum`/`#define` declarations embedded in the `.def` (some
-    /// files, e.g. `engine_local_detail.def`, declare symbol constants at the
-    /// top). Evaluate these into the [`SymbolTable`] so the
-    /// definitions in this file can reference them.
-    pub headers: Vec<HeaderItem>,
+pub struct SourceAst {
+    pub items: Vec<Item>,
+    /// Byte ranges that matched no item and were skipped, coalesced into runs.
+    ///
+    /// **Nothing reports these today, by design.** The canonical corpus is the
+    /// ground state and must compile clean, and it contains four such runs — the
+    /// leftover body of two commented-out definitions, a stray identifier, and a
+    /// duplicate `#end_definition`. Warning about them would mean a stock build
+    /// is never quiet, which trains everyone to ignore the output.
+    ///
+    /// The spans are recorded anyway because the parser has to skip these tokens
+    /// regardless, so keeping the range costs nothing, and a future verbose mode
+    /// wants exactly this: a way to catalogue the corpus's oddities without
+    /// touching the parser again. That mode should surface them as notes, not
+    /// warnings.
+    ///
+    /// Not an error channel either — the strict one-error-per-file policy (§11)
+    /// is unchanged.
+    pub ignored: Vec<Span>,
+}
+
+impl SourceAst {
+    /// The definitions this file declares, in source order.
+    pub fn definitions(&self) -> impl Iterator<Item = &Spanned<Definition>> {
+        self.items.iter().filter_map(|i| match i {
+            Item::Definition(d) => Some(d),
+            _ => None,
+        })
+    }
+
+    /// Index of each definition name into [`Self::definitions`] order. Later
+    /// duplicates within one file overwrite earlier ones, matching the
+    /// whole-body-replace semantics the builder applies across files.
+    pub fn definitions_by_name(&self) -> HashMap<&str, usize> {
+        self.definitions()
+            .enumerate()
+            .map(|(i, d)| (d.value.name.as_str(), i))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +231,59 @@ pub struct Call {
     pub arguments: Vec<Spanned<Expr>>,
 }
 
+// ── Declaration items ─────────────────────────────────────────────────────────
+//
+// Equally at home in a `.def` and a `.h`: `engine_local_detail.def` declares two
+// `enum`s whose symbols exist nowhere else. Nested bodies hold `Item`, so there
+// is one item type for the whole grammar.
+
+#[derive(Debug, Clone)]
+pub struct EnumDecl {
+    pub name: Option<String>,
+    pub variants: Vec<EnumVariant>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnumVariant {
+    pub name: String,
+    pub value: Option<EnumExpr>,
+}
+
+#[derive(Debug, Clone)]
+pub enum EnumExpr {
+    Int(i64),
+    Ident(String),
+    Shift(Vec<EnumExpr>),
+    BitOr(Vec<EnumExpr>),
+}
+
+#[derive(Debug, Clone)]
+pub struct Define {
+    pub name: String,
+    /// `None` for a valueless `#define NAME`, which C treats as "defined, empty
+    /// expansion" rather than a number. The corpus has 46 of these (every
+    /// include guard) against 25 with values.
+    ///
+    /// A valueless define contributes **no symbol**: using it where a number is
+    /// wanted is an error in C too, and keeping it out of the table means the
+    /// ~46 guard names never shadow anything.
+    pub value: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Namespace {
+    pub name: String,
+    pub items: Vec<Item>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IfDef {
+    pub condition: String,
+    pub if_branch: Vec<Item>,
+    pub else_branch: Option<Vec<Item>>,
+    pub inverted: bool,
+}
+
 pub type DefParseError = ParseError<TextParseErrorKind>;
 
 /// Whether `kind` can never appear inside a def body — a directive or header
@@ -204,7 +309,15 @@ fn is_body_terminator(kind: TokenKind) -> bool {
 
 // ── Public entry points ───────────────────────────────────────────────────────
 
-pub fn parse_def_file(input: &str) -> Result<DefFile, DefParseError> {
+/// Parse any file under `Defs/` — `.def`, `.tpl`, or `.h`.
+///
+/// There is one grammar. The extension decides where a file's *contents* are
+/// used (header-set variant resolution, definition emission), never how it is
+/// parsed. The two-parser split it replaced gave the same text different
+/// meanings depending on the extension: `#ifdef` was a real conditional in a
+/// `.h` and silently-skipped junk in a `.def`, so a guarded `#define` in a
+/// `.def` leaked its symbol unconditionally.
+pub fn parse_source(input: &str) -> Result<SourceAst, DefParseError> {
     let tokens = lex(input).map_err(|e| {
         let (span, kind) = lex_error_to_parse_error(e);
         ParseError::new(span, kind)
@@ -226,35 +339,43 @@ pub fn parse_expr_str(input: &str) -> Result<Spanned<Expr>, DefParseError> {
 
 // ── Productions on &mut Cursor ────────────────────────────────────────────────
 
-fn parse_file(cursor: &mut Cursor<'_>) -> Result<DefFile, ParseError<TextParseErrorKind>> {
-    let mut file = DefFile::default();
+/// The one top-level loop, for every file kind.
+///
+/// A file is a sequence of items: definitions and declarations. Anything else
+/// is junk — recorded in [`SourceAst::ignored`] and skipped, never a hard error.
+/// The stock corpus contains four such runs (leftovers from commented-out
+/// definitions, a stray identifier, a duplicate `#end_definition`), so erroring
+/// would fail a stock build on pre-existing dead text. The builder warns
+/// instead, which is what a modder whose edit landed outside a definition needs
+/// to hear.
+fn parse_file(cursor: &mut Cursor<'_>) -> Result<SourceAst, ParseError<TextParseErrorKind>> {
+    let mut file = SourceAst::default();
     loop {
-        match cursor.peek().kind {
-            TokenKind::Eof => break,
-            TokenKind::Definition | TokenKind::DefinitionTemplate => {
-                let def = parse_definition(cursor)?;
-                let name_index = file.definitions.len();
-                let def_name = def.value.name.clone();
-                file.definitions.push(def);
-                file.by_name.insert(def_name, name_index);
+        let kind = cursor.peek().kind;
+        if kind == TokenKind::Eof {
+            break;
+        }
+        if matches!(kind, TokenKind::Definition | TokenKind::DefinitionTemplate) {
+            file.items.push(Item::Definition(parse_definition(cursor)?));
+        } else if starts_declaration(kind) {
+            file.items.push(parse_declaration(cursor)?);
+        } else {
+            // Coalesce a run of junk into one span so a commented-out
+            // definition's leftover body is a single diagnostic, not one per
+            // token.
+            let start = cursor.peek().span.start;
+            let mut end = cursor.bump().span.end;
+            loop {
+                let k = cursor.peek().kind;
+                if k == TokenKind::Eof
+                    || matches!(k, TokenKind::Definition | TokenKind::DefinitionTemplate)
+                    || starts_declaration(k)
+                {
+                    break;
+                }
+                end = cursor.bump().span.end;
             }
-            // File-local `enum`/`#define` declarations at `.def` top level.
-            // Parsed directly on the shared cursor — no clone-bridge.
-            TokenKind::Enum | TokenKind::Define => {
-                // Propagate the inner error as-is. Re-wrapping it as
-                // "expected enum or #define declaration: {inner}" produced a
-                // doubly-nested message and discarded the inner error's own
-                // span and context.
-                file.headers.push(header::parse_item_on_cursor(cursor)?);
-            }
-            // Stray tokens between top-level items are skipped, as the
-            // pre-token parser did (its `skip_to_next_top_level_item` walked
-            // over anything up to the next `#definition`/`enum`/`#define`).
-            // This is not body-recovery — the strict body loop still errors
-            // on a missing `#end_definition`.
-            _ => {
-                cursor.bump();
-            }
+            file.ignored.push(Span { start, end });
         }
     }
     Ok(file)
@@ -607,6 +728,297 @@ fn parse_arguments(
     Ok(args)
 }
 
+// ── Declaration productions ───────────────────────────────────────────────────
+
+/// Whether `kind` starts a declaration item.
+pub(crate) fn starts_declaration(kind: TokenKind) -> bool {
+    use TokenKind as T;
+    matches!(
+        kind,
+        T::Enum | T::Define | T::Namespace | T::Ifdef | T::Ifndef | T::Pragma
+    )
+}
+
+/// Parse one declaration item (`enum` / `#define` / `namespace` /
+/// `#ifdef` / `#ifndef` / `#pragma once`) at the cursor.
+///
+/// Precondition: [`starts_declaration`] holds for the current token.
+pub(crate) fn parse_declaration(
+    cursor: &mut Cursor<'_>,
+) -> Result<Item, ParseError<TextParseErrorKind>> {
+    use TokenKind as T;
+    match cursor.peek().kind {
+        T::Enum => {
+            cursor.bump();
+            Ok(Item::Enum(parse_enum_body(cursor)?))
+        }
+        T::Define => {
+            cursor.bump();
+            Ok(Item::Define(parse_define_body(cursor)?))
+        }
+        T::Namespace => {
+            cursor.bump();
+            Ok(Item::Namespace(parse_namespace_body(cursor)?))
+        }
+        T::Ifdef | T::Ifndef => {
+            let inverted = cursor.peek().kind == T::Ifndef;
+            cursor.bump();
+            Ok(Item::Conditional(parse_if_def_body(cursor, inverted)?))
+        }
+        T::Pragma => {
+            let span = cursor.bump().span;
+            // `#pragma once` is the only pragma the corpus uses; anything else
+            // would be a name we do not know how to honor.
+            if cursor.at_ident("once") {
+                cursor.bump();
+            }
+            Ok(Item::PragmaOnce(span))
+        }
+        _ => Err(cursor.err(TextParseErrorKind::UnknownItem)),
+    }
+}
+
+fn parse_enum_body(cursor: &mut Cursor<'_>) -> Result<EnumDecl, ParseError<TextParseErrorKind>> {
+    // `enum` was already bumped by the caller; anchor on it so an anonymous
+    // enum still has something to point at.
+    let keyword_span = cursor.prev_span();
+    let name_span = cursor.peek().span;
+    let name = if cursor.at(TokenKind::Ident) {
+        Some(cursor.expect_ident("enum name")?)
+    } else {
+        None
+    };
+    let ctx = ParseContext::new(
+        "enum",
+        name.clone(),
+        if name.is_some() {
+            name_span
+        } else {
+            keyword_span
+        },
+    );
+    cursor
+        .expect(TokenKind::LBrace)
+        .map_err(|e| e.within(&ctx))?;
+    let variants = parse_enum_variants(cursor).map_err(|e| e.within(&ctx))?;
+    cursor
+        .expect(TokenKind::RBrace)
+        .map_err(|e| e.within(&ctx))?;
+    if cursor.at(TokenKind::Semi) {
+        cursor.bump();
+    }
+    Ok(EnumDecl { name, variants })
+}
+
+fn parse_enum_variants(
+    cursor: &mut Cursor<'_>,
+) -> Result<Vec<EnumVariant>, ParseError<TextParseErrorKind>> {
+    let mut variants = Vec::new();
+    loop {
+        if cursor.at(TokenKind::Eof) {
+            return Err(cursor.err(TextParseErrorKind::UnterminatedEnum));
+        }
+        if cursor.at(TokenKind::RBrace) {
+            break;
+        }
+        let variant = parse_enum_variant(cursor)?;
+        let has_value = variant.value.is_some();
+        variants.push(variant);
+        if cursor.at(TokenKind::Comma) {
+            cursor.bump();
+        } else if cursor.at(TokenKind::RBrace) {
+            break;
+        } else {
+            // Report here rather than breaking and letting the caller's
+            // `expect(RBrace)` fail, which would claim `}` was the only option.
+            //
+            // The expected set depends on how far the variant got. If it has no
+            // value yet, `parse_enum_variant` peeked for `=` at *this* byte and
+            // did not find it, so `=` is still a legal continuation and must be
+            // listed. Once a value has been read, only a separator can follow.
+            //
+            // This is also what a variant name split by a stray token looks
+            // like — `FOO BAR = 1` parses `FOO`, then lands here on `BAR` —
+            // without the message having to guess at that interpretation.
+            let expected = if has_value {
+                "`,` or `}`"
+            } else {
+                "`=`, `,` or `}`"
+            };
+            return Err(cursor.unexpected(expected));
+        }
+    }
+    Ok(variants)
+}
+
+fn parse_enum_variant(
+    cursor: &mut Cursor<'_>,
+) -> Result<EnumVariant, ParseError<TextParseErrorKind>> {
+    let name = cursor.expect_ident("identifier")?;
+    let value = if cursor.at(TokenKind::Eq) {
+        cursor.bump();
+        Some(parse_enum_expr(cursor)?)
+    } else {
+        None
+    };
+    Ok(EnumVariant { name, value })
+}
+
+fn parse_enum_expr(cursor: &mut Cursor<'_>) -> Result<EnumExpr, ParseError<TextParseErrorKind>> {
+    parse_enum_bitor(cursor)
+}
+
+fn parse_enum_bitor(cursor: &mut Cursor<'_>) -> Result<EnumExpr, ParseError<TextParseErrorKind>> {
+    let first = parse_enum_shift(cursor)?;
+    let mut terms = vec![first];
+    while cursor.at(TokenKind::Pipe) {
+        cursor.bump();
+        terms.push(parse_enum_shift(cursor)?);
+    }
+    Ok(if terms.len() == 1 {
+        terms.pop().unwrap()
+    } else {
+        EnumExpr::BitOr(terms)
+    })
+}
+
+fn parse_enum_shift(cursor: &mut Cursor<'_>) -> Result<EnumExpr, ParseError<TextParseErrorKind>> {
+    let first = parse_enum_leaf(cursor)?;
+    let mut terms = vec![first];
+    while cursor.at(TokenKind::Shl) {
+        cursor.bump();
+        terms.push(parse_enum_leaf(cursor)?);
+    }
+    Ok(if terms.len() == 1 {
+        terms.pop().unwrap()
+    } else {
+        EnumExpr::Shift(terms)
+    })
+}
+
+fn parse_enum_leaf(cursor: &mut Cursor<'_>) -> Result<EnumExpr, ParseError<TextParseErrorKind>> {
+    use TokenKind;
+    match cursor.peek().kind {
+        TokenKind::Number => {
+            let t = cursor.bump();
+            let n = t
+                .source
+                .parse::<i64>()
+                .map_err(|_| ParseError::new(t.span, TextParseErrorKind::InvalidNumber))?;
+            Ok(EnumExpr::Int(n))
+        }
+        TokenKind::Ident => {
+            let t = cursor.bump();
+            Ok(EnumExpr::Ident(t.source.to_string()))
+        }
+        _ => Err(cursor.unexpected("number or identifier")),
+    }
+}
+
+fn parse_define_body(cursor: &mut Cursor<'_>) -> Result<Define, ParseError<TextParseErrorKind>> {
+    let name = cursor.expect_ident("identifier")?;
+    // The value is optional: `#define __FOO_H__` is an include guard, not a
+    // malformed constant.
+    if !cursor.at(TokenKind::Number) {
+        return Ok(Define { name, value: None });
+    }
+    let t = cursor.bump();
+    let value = t
+        .source
+        .parse::<i64>()
+        .map_err(|_| ParseError::new(t.span, TextParseErrorKind::InvalidNumber))?;
+    Ok(Define {
+        name,
+        value: Some(value),
+    })
+}
+
+fn parse_namespace_body(
+    cursor: &mut Cursor<'_>,
+) -> Result<Namespace, ParseError<TextParseErrorKind>> {
+    let name_span = cursor.peek().span;
+    let name = cursor.expect_ident("identifier")?;
+    let ctx = ParseContext::new("namespace", Some(name.clone()), name_span);
+    cursor
+        .expect(TokenKind::LBrace)
+        .map_err(|e| e.within(&ctx))?;
+    let mut items = Vec::new();
+    loop {
+        if cursor.at(TokenKind::Eof) {
+            return Err(cursor
+                .err(TextParseErrorKind::UnterminatedNamespace)
+                .within(&ctx));
+        }
+        if cursor.at(TokenKind::RBrace) {
+            break;
+        }
+        items.push(parse_declaration(cursor).map_err(|e| e.within(&ctx))?);
+    }
+    cursor
+        .expect(TokenKind::RBrace)
+        .map_err(|e| e.within(&ctx))?;
+    if cursor.at(TokenKind::Semi) {
+        cursor.bump();
+    }
+    Ok(Namespace { name, items })
+}
+
+fn parse_if_def_body(
+    cursor: &mut Cursor<'_>,
+    inverted: bool,
+) -> Result<IfDef, ParseError<TextParseErrorKind>> {
+    let directive = if inverted { "#ifndef" } else { "#ifdef" };
+    let cond_span = cursor.peek().span;
+    let condition = cursor.expect_ident("identifier")?;
+    let ctx = ParseContext::new(directive, Some(condition.clone()), cond_span);
+    let mut if_branch = Vec::new();
+    loop {
+        if cursor.at(TokenKind::Eof) {
+            return Err(cursor
+                .err(TextParseErrorKind::UnterminatedIfDef)
+                .within(&ctx));
+        }
+        if cursor.at(TokenKind::Else) || cursor.at(TokenKind::Endif) {
+            break;
+        }
+        if_branch.push(parse_declaration(cursor).map_err(|e| e.within(&ctx))?);
+    }
+    let else_branch = if cursor.at(TokenKind::Else) {
+        cursor.bump();
+        let mut else_branch = Vec::new();
+        loop {
+            if cursor.at(TokenKind::Eof) {
+                return Err(cursor
+                    .err(TextParseErrorKind::UnterminatedIfDef)
+                    .within(&ctx));
+            }
+            if cursor.at(TokenKind::Endif) {
+                break;
+            }
+            else_branch.push(parse_declaration(cursor).map_err(|e| e.within(&ctx))?);
+        }
+        Some(else_branch)
+    } else {
+        None
+    };
+    cursor
+        .expect(TokenKind::Endif)
+        .map_err(|e| e.within(&ctx))?;
+    // `#endif __GUARD_NAME__` — the pre-C99 habit of naming the condition on
+    // the closer. One occurrence in the corpus, and it is a real C idiom, so
+    // accept it rather than leaving a trailing identifier to be reported as
+    // stray text.
+    if cursor.at(TokenKind::Ident) {
+        cursor.bump();
+    }
+    Ok(IfDef {
+        condition,
+        if_branch,
+        else_branch,
+        inverted,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::lexer::TextParseErrorKind;
@@ -614,15 +1026,25 @@ mod tests {
 
     fn parse_def(body: &str) -> Spanned<Definition> {
         let input = format!("#definition OBJECT T\n{body}\n#end_definition");
-        parse_def_file(&input).unwrap().definitions.pop().unwrap()
+        parse_source(&input)
+            .unwrap()
+            .definitions()
+            .next()
+            .unwrap()
+            .clone()
     }
 
     fn parse_first_def(input: &str) -> Spanned<Definition> {
-        parse_def_file(input).unwrap().definitions.pop().unwrap()
+        parse_source(input)
+            .unwrap()
+            .definitions()
+            .next()
+            .unwrap()
+            .clone()
     }
 
     fn parse_err(input: &str) -> TextParseErrorKind {
-        parse_def_file(input).unwrap_err().inner
+        parse_source(input).unwrap_err().inner
     }
 
     fn parse_stmt(stmt: &str) -> Spanned<Statement> {
@@ -893,13 +1315,13 @@ mod tests {
 
     #[test]
     fn end_definition_trailing_semicolon() {
-        let file = parse_def_file("#definition OBJECT T\n  Health 100;\n#end_definition;").unwrap();
-        assert_eq!(file.definitions.len(), 1);
+        let file = parse_source("#definition OBJECT T\n  Health 100;\n#end_definition;").unwrap();
+        assert_eq!(file.definitions().count(), 1);
     }
 
     #[test]
     fn multiple_definitions_preserve_order() {
-        let file = parse_def_file(
+        let file = parse_source(
             r#"
     #definition OBJECT FIRST
     #end_definition
@@ -909,11 +1331,12 @@ mod tests {
     "#,
         )
         .unwrap();
-        assert_eq!(file.definitions.len(), 2);
-        assert_eq!(file.definitions[0].value.name, "FIRST");
-        assert_eq!(file.definitions[1].value.name, "SECOND");
-        assert_eq!(file.by_name["FIRST"], 0);
-        assert_eq!(file.by_name["SECOND"], 1);
+        assert_eq!(file.definitions().count(), 2);
+        assert_eq!(file.definitions().next().unwrap().value.name, "FIRST");
+        assert_eq!(file.definitions().nth(1).unwrap().value.name, "SECOND");
+        let by_name = file.definitions_by_name();
+        assert_eq!(by_name["FIRST"], 0);
+        assert_eq!(by_name["SECOND"], 1);
     }
 
     #[test]
@@ -1001,7 +1424,7 @@ mod tests {
             "  Health 200;\n",
             "#end_definition\n",
         );
-        let err = parse_def_file(input).unwrap_err();
+        let err = parse_source(input).unwrap_err();
         assert!(matches!(
             err.inner,
             TextParseErrorKind::MissingEndDefinition
@@ -1016,23 +1439,26 @@ mod tests {
 
     #[test]
     fn empty_file() {
-        assert!(parse_def_file("").unwrap().definitions.is_empty());
+        let f = parse_source("").unwrap();
+        assert!(f.items.is_empty());
+        assert!(f.ignored.is_empty());
     }
 
     #[test]
     fn whitespace_only() {
         assert!(
-            parse_def_file("   \n\t  \n  ")
+            parse_source("   \n\t  \n  ")
                 .unwrap()
-                .definitions
-                .is_empty()
+                .definitions()
+                .next()
+                .is_none()
         );
     }
 
     #[test]
     fn comments_only() {
         let input = "// line comment\n/* block\n   comment */\n";
-        assert!(parse_def_file(input).unwrap().definitions.is_empty());
+        assert!(parse_source(input).unwrap().definitions().next().is_none());
     }
 
     #[test]
@@ -1059,10 +1485,277 @@ mod tests {
         Health 200;
     #end_definition;
     "#;
-        let file = parse_def_file(input).unwrap();
-        assert_eq!(file.definitions.len(), 2);
-        assert_eq!(file.definitions[0].value.name, "FIRST");
-        assert_eq!(file.definitions[1].value.name, "SECOND");
-        assert_eq!(file.headers.len(), 1);
+        let file = parse_source(input).unwrap();
+        assert_eq!(file.definitions().count(), 2);
+        assert_eq!(file.definitions().next().unwrap().value.name, "FIRST");
+        assert_eq!(file.definitions().nth(1).unwrap().value.name, "SECOND");
+        assert_eq!(
+            file.items
+                .iter()
+                .filter(|i| matches!(i, Item::Enum(_)))
+                .count(),
+            1
+        );
+    }
+
+    // ── Declaration items ─────────────────────────────────────────────────
+    fn parse_h(input: &str) -> SourceAst {
+        parse_source(input).expect("header parse ok")
+    }
+
+    fn parse_h_err(input: &str) -> TextParseErrorKind {
+        parse_source(input).unwrap_err().inner
+    }
+
+    /// An include guard is ordinary structure, not a prologue to skip: a
+    /// `#pragma once` item and an `#ifndef` conditional wrapping the file.
+    ///
+    /// It evaluates correctly on its own — the guard name is undefined, the
+    /// condition is inverted, so the branch is taken — which is why the
+    /// bespoke `skip_prologue`/`skip_epilogue` pair could be deleted. The
+    /// guard's own valueless `#define` contributes no symbol, so the ~46 guard
+    /// names in the corpus never reach the table.
+    #[test]
+    fn include_guard_is_an_ordinary_conditional() {
+        let h = parse_h("#pragma once\n#ifndef __FOO_H__\n#define __FOO_H__\n#endif");
+        assert_eq!(h.items.len(), 2);
+        assert!(matches!(h.items[0], Item::PragmaOnce(_)));
+        let Item::Conditional(ifdef) = &h.items[1] else {
+            panic!("expected the guard to parse as a conditional")
+        };
+        assert!(ifdef.inverted);
+        assert_eq!(ifdef.condition, "__FOO_H__");
+        assert_eq!(ifdef.if_branch.len(), 1);
+        assert!(h.ignored.is_empty());
+
+        let mut t = super::SymbolTable::new();
+        t.evaluate_items(&h.items).expect("guard evaluates");
+        assert_eq!(
+            t.lookup("__FOO_H__"),
+            None,
+            "valueless define binds nothing"
+        );
+    }
+
+    #[test]
+    fn named_enum() {
+        let h = parse_h("enum EFoo { A = 1, B = 2 };");
+        assert_eq!(h.items.len(), 1);
+        let Item::Enum(decl) = &h.items[0] else {
+            panic!()
+        };
+        assert_eq!(decl.name.as_deref(), Some("EFoo"));
+        assert_eq!(decl.variants.len(), 2);
+        assert_eq!(decl.variants[0].name, "A");
+        assert!(matches!(decl.variants[0].value, Some(EnumExpr::Int(1))));
+        assert_eq!(decl.variants[1].name, "B");
+        assert!(matches!(decl.variants[1].value, Some(EnumExpr::Int(2))));
+    }
+
+    #[test]
+    fn anonymous_enum() {
+        let h = parse_h("enum { A = 1, B = 2 };");
+        let Item::Enum(decl) = &h.items[0] else {
+            panic!()
+        };
+        assert!(decl.name.is_none());
+        assert_eq!(decl.variants.len(), 2);
+    }
+
+    #[test]
+    fn auto_increment() {
+        let h = parse_h("enum EFoo { A = 1, B, C = 5, D };");
+        let Item::Enum(decl) = &h.items[0] else {
+            panic!()
+        };
+        assert!(matches!(decl.variants[0].value, Some(EnumExpr::Int(1))));
+        assert!(decl.variants[1].value.is_none()); // B = 2 (auto)
+        assert!(matches!(decl.variants[2].value, Some(EnumExpr::Int(5))));
+        assert!(decl.variants[3].value.is_none()); // D = 6 (auto)
+    }
+
+    #[test]
+    fn enum_with_ident_value() {
+        let h = parse_h("enum EFoo { A = NO_SOUND_TYPES };");
+        let Item::Enum(decl) = &h.items[0] else {
+            panic!()
+        };
+        assert!(matches!(
+            &decl.variants[0].value,
+            Some(EnumExpr::Ident(s)) if s == "NO_SOUND_TYPES"
+        ));
+    }
+
+    #[test]
+    fn enum_with_bitor_expression() {
+        let h = parse_h("enum EFoo { A = 1 | 2 | 4 };");
+        let Item::Enum(decl) = &h.items[0] else {
+            panic!()
+        };
+        assert!(
+            matches!(&decl.variants[0].value, Some(EnumExpr::BitOr(terms)) if terms.len() == 3)
+        );
+    }
+
+    #[test]
+    fn enum_with_shift_expression() {
+        let h = parse_h("enum EFoo { A = 1 << 0, B = 1 << 1 };");
+        let Item::Enum(decl) = &h.items[0] else {
+            panic!()
+        };
+        assert!(
+            matches!(&decl.variants[0].value, Some(EnumExpr::Shift(terms)) if terms.len() == 2)
+        );
+    }
+
+    #[test]
+    fn enum_trailing_comma() {
+        let h = parse_h("enum EFoo { A = 1, B = 2, };");
+        let Item::Enum(decl) = &h.items[0] else {
+            panic!()
+        };
+        assert_eq!(decl.variants.len(), 2);
+    }
+
+    #[test]
+    fn enum_no_trailing_semicolon() {
+        let h = parse_h("enum EFoo { A = 1 }");
+        assert_eq!(h.items.len(), 1);
+    }
+
+    #[test]
+    fn define_positive() {
+        let h = parse_h("#define FOO 42");
+        let Item::Define(d) = &h.items[0] else {
+            panic!()
+        };
+        assert_eq!(d.name, "FOO");
+        assert_eq!(d.value, Some(42));
+    }
+
+    #[test]
+    fn define_negative() {
+        let h = parse_h("#define FOO -42");
+        let Item::Define(d) = &h.items[0] else {
+            panic!()
+        };
+        assert_eq!(d.value, Some(-42));
+    }
+
+    #[test]
+    fn namespace_with_enums() {
+        let h = parse_h("namespace NFoo { enum EA { X = 1 }; }");
+        let Item::Namespace(ns) = &h.items[0] else {
+            panic!()
+        };
+        assert_eq!(ns.name, "NFoo");
+        assert_eq!(ns.items.len(), 1);
+    }
+
+    #[test]
+    fn ifdef_with_else() {
+        let h = parse_h("#ifdef _WINDOWS\n#define FOO 1\n#else\n#define FOO 2\n#endif");
+        let Item::Conditional(ifdef) = &h.items[0] else {
+            panic!()
+        };
+        assert_eq!(ifdef.condition, "_WINDOWS");
+        assert_eq!(ifdef.if_branch.len(), 1);
+        assert_eq!(ifdef.else_branch.as_ref().unwrap().len(), 1);
+        assert!(!ifdef.inverted);
+    }
+
+    #[test]
+    fn ifndef_as_item() {
+        // Put `#ifndef` after a namespace so it's not consumed by the prologue.
+        let h = parse_h("namespace N { #ifndef _WINDOWS\n#define FOO 1\n#endif }");
+        let Item::Namespace(ns) = &h.items[0] else {
+            panic!()
+        };
+        assert_eq!(ns.items.len(), 1);
+        let Item::Conditional(ifdef) = &ns.items[0] else {
+            panic!()
+        };
+        assert!(ifdef.inverted);
+        assert_eq!(ifdef.if_branch.len(), 1);
+    }
+
+    #[test]
+    fn full_header_file() {
+        let h = parse_h(
+            "#pragma once\n\
+             #ifndef __FOO_H__\n\
+             #define __FOO_H__\n\
+             #define MAX_THINGS 100\n\
+             enum EFoo { A = 1, B = 2 };\n\
+             #endif",
+        );
+        // Prologue consumed: #pragma, #ifndef, #define. Items: MAX_THINGS, EFoo.
+        assert_eq!(h.items.len(), 2);
+    }
+
+    #[test]
+    fn file_with_no_guard() {
+        let h = parse_h("#define FOO 1\nenum EBar { A };\n");
+        assert_eq!(h.items.len(), 2);
+    }
+
+    // --- error cases ---
+
+    #[test]
+    fn err_unterminated_enum() {
+        let kind = parse_h_err("enum EFoo { A = 1");
+        assert!(matches!(kind, TextParseErrorKind::UnexpectedToken { .. }));
+    }
+
+    #[test]
+    fn err_unterminated_enum_eof_after_comma() {
+        // EOF after a comma is a genuine UnterminatedEnum.
+        let kind = parse_h_err("enum EFoo { A = 1,");
+        assert!(matches!(kind, TextParseErrorKind::UnterminatedEnum));
+    }
+
+    #[test]
+    fn err_unterminated_namespace() {
+        let kind = parse_h_err("namespace NFoo { enum EA { X = 1 };");
+        assert!(matches!(kind, TextParseErrorKind::UnterminatedNamespace));
+    }
+
+    #[test]
+    fn err_unterminated_ifdef() {
+        let kind = parse_h_err("#ifdef _WINDOWS\n#define FOO 1\n");
+        assert!(matches!(kind, TextParseErrorKind::UnterminatedIfDef));
+    }
+
+    /// Text matching no item is recorded as ignored rather than erroring:
+    /// the stock corpus contains four such runs (leftovers from commented-out
+    /// definitions), so erroring would fail a stock build.
+    #[test]
+    fn unknown_top_level_text_is_ignored_not_an_error() {
+        let h = parse_h("foo bar");
+        assert!(h.items.is_empty());
+        assert_eq!(h.ignored.len(), 1);
+    }
+
+    /// `#define FOO abc` is a non-numeric macro, which this grammar does not
+    /// model (the corpus has none). `FOO` binds nothing and `abc` becomes
+    /// ignored text the builder warns about — the same rule as any other
+    /// unrecognized top-level token, rather than a special case.
+    #[test]
+    fn non_numeric_define_value_is_ignored_text() {
+        let h = parse_h("#define FOO abc");
+        let Item::Define(d) = &h.items[0] else {
+            panic!()
+        };
+        assert_eq!(d.name, "FOO");
+        assert_eq!(d.value, None);
+        assert_eq!(h.ignored.len(), 1);
+    }
+
+    #[test]
+    fn stray_guard_name_after_endif_consumed() {
+        // `#endif __GUARD__` (no `//`) is consumed by the epilogue, matching
+        // the old parser's `skip_to_end_of_line`.
+        let h = parse_h("#define FOO 1\n#endif __GUARD_NAME__");
+        assert_eq!(h.items.len(), 1); // FOO
     }
 }

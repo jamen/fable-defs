@@ -11,7 +11,7 @@ pub use crate::wire;
 
 pub use crate::enums::*;
 pub use crate::text::{
-    DefParseError, Definition, Expr, PathSegment, Span, Spanned, Statement, parse_def_file,
+    DefParseError, Definition, Expr, PathSegment, Span, Spanned, Statement, parse_source,
 };
 pub use crate::values::*;
 pub use crate::wire::{DefIndex, DefString, PString, VecMap, WStr, Wire};

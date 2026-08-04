@@ -1,4 +1,4 @@
-use super::header::{EnumDecl, EnumExpr, Header, HeaderItem};
+use super::{EnumDecl, EnumExpr, Item};
 use std::collections::HashMap;
 
 pub struct SymbolTable {
@@ -52,42 +52,43 @@ pub struct Redefinition {
 }
 
 impl SymbolTable {
-    /// Evaluate a parsed header file into the table, returning every symbol it
-    /// redefined.
-    pub fn evaluate(&mut self, header: &Header) -> Result<Vec<Redefinition>, SymbolEvalError> {
-        self.evaluate_items(&header.items)
-    }
-    /// Evaluate a list of header items (e.g. the file-local `enum`/`#define`
-    /// declarations parsed from a `.def` file) into the table.
-    pub fn evaluate_items(
-        &mut self,
-        items: &[HeaderItem],
-    ) -> Result<Vec<Redefinition>, SymbolEvalError> {
+    /// Evaluate a parsed file's declarations into the table, returning every
+    /// symbol it redefined.
+    ///
+    /// Definitions are skipped: this walk is only interested in what a file
+    /// *declares*. Both `.h` and `.def` go through here — a `.def` carrying
+    /// `enum`s (`engine_local_detail.def`) contributes symbols exactly as a
+    /// header does, and both are merged into the one global table.
+    pub fn evaluate_items(&mut self, items: &[Item]) -> Result<Vec<Redefinition>, SymbolEvalError> {
         let mut redefined = Vec::new();
         for item in items {
-            self.evaluate_header_item(item, &mut redefined)?;
+            self.evaluate_item(item, &mut redefined)?;
         }
         Ok(redefined)
     }
-    fn evaluate_header_item(
+    fn evaluate_item(
         &mut self,
-        item: &HeaderItem,
+        item: &Item,
         redefined: &mut Vec<Redefinition>,
     ) -> Result<(), SymbolEvalError> {
-        use HeaderItem as I;
+        use Item as I;
         match item {
             I::Enum(decl) => self.evaluate_enum(decl, redefined),
             I::Define(d) => {
-                self.define(&d.name, d.value, redefined);
+                // A valueless `#define NAME` (every include guard) binds no
+                // number, so it contributes nothing to the table.
+                if let Some(value) = d.value {
+                    self.define(&d.name, value, redefined);
+                }
                 Ok(())
             }
             I::Namespace(ns) => {
                 for item in &ns.items {
-                    self.evaluate_header_item(item, redefined)?;
+                    self.evaluate_item(item, redefined)?;
                 }
                 Ok(())
             }
-            I::IfDef(ifdef) => {
+            I::Conditional(ifdef) => {
                 let taken = self.is_defined(&ifdef.condition) ^ ifdef.inverted;
                 let branch = if taken {
                     &ifdef.if_branch
@@ -95,10 +96,11 @@ impl SymbolTable {
                     ifdef.else_branch.as_deref().unwrap_or(&[])
                 };
                 for item in branch {
-                    self.evaluate_header_item(item, redefined)?;
+                    self.evaluate_item(item, redefined)?;
                 }
                 Ok(())
             }
+            I::Definition(_) | I::PragmaOnce(_) => Ok(()),
         }
     }
     fn evaluate_enum(
@@ -170,12 +172,14 @@ impl SymbolTable {
 
 #[cfg(test)]
 mod tests {
-    use super::super::header::parse_header_file;
+    use super::super::parse_source;
     use super::*;
 
     fn eval(table: &mut SymbolTable, src: &str) -> Vec<Redefinition> {
-        let header = parse_header_file(src).expect("header parses");
-        table.evaluate(&header).expect("header evaluates")
+        let header = parse_source(src).expect("header parses");
+        table
+            .evaluate_items(&header.items)
+            .expect("header evaluates")
     }
 
     #[test]
@@ -235,9 +239,9 @@ mod tests {
     #[test]
     fn unknown_symbol_in_enum_expression_is_still_an_error() {
         let mut t = SymbolTable::new();
-        let header = parse_header_file("enum E { A = NOPE };").unwrap();
+        let header = parse_source("enum E { A = NOPE };").unwrap();
         assert!(matches!(
-            t.evaluate(&header),
+            t.evaluate_items(&header.items),
             Err(SymbolEvalError::UnknownSymbol(n)) if n == "NOPE"
         ));
     }
