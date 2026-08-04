@@ -53,7 +53,7 @@ use std::collections::HashMap;
 
 fn spanned_expr(value: Expr) -> Spanned<Expr> {
     Spanned {
-        span: Span { start: 0, end: 0 },
+        span: Span::SYNTHETIC,
         value,
     }
 }
@@ -94,7 +94,7 @@ impl std::fmt::Display for LowerError {
                 write!(f, "specialization cycle detected at {name}")
             }
             LowerError::UnresolvedReference(r, _) => {
-                write!(f, "unresolved reference: {r}")
+                write!(f, "unknown definition `{r}`")
             }
             LowerError::Reader(e) => write!(f, "{e}"),
         }
@@ -118,6 +118,10 @@ impl LowerError {
             LowerError::Reader(DefReaderError::Semantic(_, span)) => *span,
             LowerError::Reader(DefReaderError::MissingField(_, span)) => Some(*span),
             LowerError::Reader(DefReaderError::MissingArg(_, span)) => Some(*span),
+            // The variant has always carried a `Spanned<Statement>`; not
+            // reading it here meant `group.finish()` errors rendered with no
+            // caret at all, pointing only at the enclosing definition.
+            LowerError::Reader(DefReaderError::UnexpectedStatement(stmt)) => Some(stmt.span),
             LowerError::MissingParent { span, .. } => *span,
             LowerError::SpecializationCycle(_, span) => *span,
             _ => None,

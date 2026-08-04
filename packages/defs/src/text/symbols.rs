@@ -1,4 +1,6 @@
+use super::base::{Span, Spanned};
 use super::{EnumDecl, EnumExpr, Item};
+use derive_more::{Display, Error};
 use std::collections::HashMap;
 
 pub struct SymbolTable {
@@ -31,10 +33,37 @@ impl SymbolTable {
     }
 }
 
-#[derive(Debug)]
+/// A declaration that could not be evaluated into a symbol value.
+///
+/// Spanned, and with a real `Display`: these used to be rendered with `{e:?}`,
+/// so a broken header reported `UnknownSymbol("FOO")` with no location.
+#[derive(Debug, Display, Error)]
 pub enum SymbolEvalError {
-    UnknownSymbol(String),
-    InvalidShift(i64),
+    #[display("unknown constant `{name}`")]
+    UnknownSymbol { name: String, span: Span },
+    #[display("shift amount {amount} is out of range (expected 0..64)")]
+    InvalidShift { amount: i64, span: Span },
+}
+
+impl SymbolEvalError {
+    pub fn span(&self) -> Span {
+        match self {
+            SymbolEvalError::UnknownSymbol { span, .. }
+            | SymbolEvalError::InvalidShift { span, .. } => *span,
+        }
+    }
+}
+
+/// The source range an enum-value expression covers. Compound forms report the
+/// first leaf, which is where a reader looks first.
+fn enum_expr_span(expr: &EnumExpr) -> Span {
+    match expr {
+        EnumExpr::Int(n) => n.span,
+        EnumExpr::Ident(name) => name.span,
+        EnumExpr::Shift(terms) | EnumExpr::BitOr(terms) => {
+            terms.first().map_or(Span::SYNTHETIC, enum_expr_span)
+        }
+    }
 }
 
 /// A symbol that was already defined when a later definition overwrote it.
@@ -49,6 +78,8 @@ pub struct Redefinition {
     pub previous: i64,
     /// The value that won.
     pub value: i64,
+    /// Where the winning definition is written.
+    pub span: Span,
 }
 
 impl SymbolTable {
@@ -123,12 +154,13 @@ impl SymbolTable {
         Ok(())
     }
     /// Insert, recording a redefinition if the name was already bound.
-    fn define(&mut self, name: &str, value: i64, redefined: &mut Vec<Redefinition>) {
-        if let Some(previous) = self.insert(name, value) {
+    fn define(&mut self, name: &Spanned<String>, value: i64, redefined: &mut Vec<Redefinition>) {
+        if let Some(previous) = self.insert(&name.value, value) {
             redefined.push(Redefinition {
-                name: name.to_string(),
+                name: name.value.clone(),
                 previous,
                 value,
+                span: name.span,
             });
         }
     }
@@ -147,17 +179,24 @@ impl SymbolTable {
     fn evaluate_enum_expr(&self, expr: &EnumExpr) -> Result<i64, SymbolEvalError> {
         use EnumExpr as E;
         match expr {
-            E::Int(n) => Ok(*n),
-            E::Ident(name) => self
-                .lookup(name)
-                .ok_or_else(|| SymbolEvalError::UnknownSymbol(name.clone())),
+            E::Int(n) => Ok(n.value),
+            E::Ident(name) => {
+                self.lookup(&name.value)
+                    .ok_or_else(|| SymbolEvalError::UnknownSymbol {
+                        name: name.value.clone(),
+                        span: name.span,
+                    })
+            }
             E::Shift(terms) => {
                 let mut iter = terms.iter();
                 let first = self.evaluate_enum_expr(iter.next().unwrap())?;
                 iter.try_fold(first, |acc, term| {
                     let n = self.evaluate_enum_expr(term)?;
                     if !(0..64).contains(&n) {
-                        return Err(SymbolEvalError::InvalidShift(n));
+                        return Err(SymbolEvalError::InvalidShift {
+                            amount: n,
+                            span: enum_expr_span(term),
+                        });
                     }
                     Ok(acc << n)
                 })
@@ -172,11 +211,11 @@ impl SymbolTable {
 
 #[cfg(test)]
 mod tests {
-    use super::super::parse_source;
+    use super::super::{FileId, parse_source};
     use super::*;
 
     fn eval(table: &mut SymbolTable, src: &str) -> Vec<Redefinition> {
-        let header = parse_source(src).expect("header parses");
+        let header = parse_source(src, FileId::ANONYMOUS).expect("header parses");
         table
             .evaluate_items(&header.items)
             .expect("header evaluates")
@@ -193,7 +232,8 @@ mod tests {
             vec![Redefinition {
                 name: "A".into(),
                 previous: 1,
-                value: 2
+                value: 2,
+                span: redefined[0].span,
             }]
         );
     }
@@ -239,10 +279,10 @@ mod tests {
     #[test]
     fn unknown_symbol_in_enum_expression_is_still_an_error() {
         let mut t = SymbolTable::new();
-        let header = parse_source("enum E { A = NOPE };").unwrap();
+        let header = parse_source("enum E { A = NOPE };", FileId::ANONYMOUS).unwrap();
         assert!(matches!(
             t.evaluate_items(&header.items),
-            Err(SymbolEvalError::UnknownSymbol(n)) if n == "NOPE"
+            Err(SymbolEvalError::UnknownSymbol { name, .. }) if name == "NOPE"
         ));
     }
 

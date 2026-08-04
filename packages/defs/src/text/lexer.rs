@@ -18,7 +18,7 @@
 //! /`#pragma`) is represented in the token set — added in Phase 3 for the
 //! header-grammar merge.
 
-use super::base::{ParseError, Span};
+use super::base::{FileId, ParseError, Span, Spanned};
 use derive_more::{Display, Error};
 use std::borrow::Cow;
 
@@ -236,6 +236,12 @@ impl<'a> Cursor<'a> {
         self.tokens[self.pos.saturating_sub(1)].span
     }
 
+    /// The file being parsed. Every token carries it, including the trailing
+    /// `Eof`, so this is always available.
+    pub fn file(&self) -> FileId {
+        self.peek().span.file
+    }
+
     /// An error about the token the cursor is sitting on. The error span is the
     /// whole token, so the caret underlines it.
     pub fn err(&self, kind: TextParseErrorKind) -> ParseError<TextParseErrorKind> {
@@ -258,10 +264,22 @@ impl<'a> Cursor<'a> {
         &mut self,
         what: &'static str,
     ) -> Result<String, ParseError<TextParseErrorKind>> {
+        Ok(self.expect_ident_spanned(what)?.value)
+    }
+
+    /// [`expect_ident`](Self::expect_ident) keeping the name's span, for AST
+    /// nodes whose names have to be pointed at after parsing.
+    pub fn expect_ident_spanned(
+        &mut self,
+        what: &'static str,
+    ) -> Result<Spanned<String>, ParseError<TextParseErrorKind>> {
         let t = self.peek();
         if t.kind == TokenKind::Ident {
             self.bump();
-            Ok(t.source.to_string())
+            Ok(Spanned {
+                span: t.span,
+                value: t.source.to_string(),
+            })
         } else {
             Err(self.unexpected(what))
         }
@@ -284,11 +302,19 @@ impl<'a> Cursor<'a> {
 pub struct Lexer<'a> {
     input: &'a str,
     pos: usize,
+    /// Stamped onto every span this lexer produces, so a token knows its file
+    /// for as long as it survives — including after specialization copies it
+    /// into a definition in a different file.
+    file: FileId,
 }
 
 impl<'a> Lexer<'a> {
-    pub fn new(input: &'a str) -> Self {
-        Self { input, pos: 0 }
+    pub fn new(input: &'a str, file: FileId) -> Self {
+        Self {
+            input,
+            pos: 0,
+            file,
+        }
     }
 
     /// Tokenize the whole input, ending with a single [`TokenKind::Eof`].
@@ -320,7 +346,7 @@ impl<'a> Lexer<'a> {
     fn token(&self, kind: TokenKind, start: usize, end: usize) -> Token<'a> {
         Token {
             kind,
-            span: Span { start, end },
+            span: Span::new(self.file, start, end),
             source: &self.input[start..end],
         }
     }
@@ -363,10 +389,7 @@ impl<'a> Lexer<'a> {
                 // the file: the opener is the thing the reader has to go fix.
                 return Err(LexError {
                     kind: LexErrorKind::UnterminatedBlockComment,
-                    span: Span {
-                        start: self.pos,
-                        end: (self.pos + 2).min(self.input.len()),
-                    },
+                    span: Span::new(self.file, self.pos, (self.pos + 2).min(self.input.len())),
                 });
             }
             // A bare decorative banner (`*****…` with no leading `/`). `*` and
@@ -457,10 +480,7 @@ impl<'a> Lexer<'a> {
         // reader has to go fix is where the string started.
         Err(LexError {
             kind: LexErrorKind::UnterminatedString,
-            span: Span {
-                start,
-                end: (start + 1).min(self.input.len()),
-            },
+            span: Span::new(self.file, start, (start + 1).min(self.input.len())),
         })
     }
 
@@ -507,10 +527,7 @@ impl<'a> Lexer<'a> {
             _ => {
                 return Err(LexError {
                     kind: LexErrorKind::UnexpectedChar('#'),
-                    span: Span {
-                        start,
-                        end: start + 1,
-                    },
+                    span: Span::new(self.file, start, start + 1),
                 });
             }
         };
@@ -549,10 +566,7 @@ impl<'a> Lexer<'a> {
             other => {
                 return Err(LexError {
                     kind: LexErrorKind::UnexpectedChar(other),
-                    span: Span {
-                        start,
-                        end: start + other.len_utf8(),
-                    },
+                    span: Span::new(self.file, start, start + other.len_utf8()),
                 });
             }
         };
@@ -563,8 +577,8 @@ impl<'a> Lexer<'a> {
 
 /// Tokenize `input` into a `Vec` ending with a single `Eof`, or the first
 /// [`LexError`].
-pub fn lex(input: &str) -> Result<Vec<Token<'_>>, LexError> {
-    Lexer::new(input).tokenize()
+pub fn lex(input: &str, file: FileId) -> Result<Vec<Token<'_>>, LexError> {
+    Lexer::new(input, file).tokenize()
 }
 
 #[cfg(test)]
@@ -573,7 +587,7 @@ mod tests {
 
     /// Lex, dropping the trailing `Eof`, and collect just the kinds.
     fn kinds(input: &str) -> Vec<TokenKind> {
-        let mut toks = lex(input).expect("lex ok");
+        let mut toks = lex(input, FileId::ANONYMOUS).expect("lex ok");
         assert_eq!(toks.last().map(|t| t.kind), Some(TokenKind::Eof));
         toks.pop();
         toks.into_iter().map(|t| t.kind).collect()
@@ -581,13 +595,15 @@ mod tests {
 
     /// Lex, dropping the trailing `Eof`, and collect `(kind, source)` pairs.
     fn toks(input: &str) -> Vec<(TokenKind, &str)> {
-        let mut toks = lex(input).expect("lex ok");
+        let mut toks = lex(input, FileId::ANONYMOUS).expect("lex ok");
         toks.pop(); // Eof
         toks.into_iter().map(|t| (t.kind, t.source)).collect()
     }
 
     fn lex_err(input: &str) -> LexErrorKind {
-        lex(input).expect_err("expected lex error").kind
+        lex(input, FileId::ANONYMOUS)
+            .expect_err("expected lex error")
+            .kind
     }
 
     use TokenKind::*;
@@ -643,7 +659,7 @@ mod tests {
     #[test]
     fn string_source_reproduces_exactly() {
         let input = r#"Name "Test""#;
-        let t = &lex(input).unwrap()[1];
+        let t = &lex(input, FileId::ANONYMOUS).unwrap()[1];
         assert_eq!(t.kind, Str);
         assert_eq!(&input[t.span.start..t.span.end], t.source);
         assert_eq!(t.source, r#""Test""#);
@@ -852,15 +868,15 @@ mod tests {
         let input = "Health\r\n100";
         let t = toks(input);
         assert_eq!(t, vec![(Ident, "Health"), (Number, "100")]);
-        let full = lex(input).unwrap();
-        assert_eq!(full[1].span, Span { start: 8, end: 11 });
+        let full = lex(input, FileId::ANONYMOUS).unwrap();
+        assert_eq!(full[1].span, Span::new(FileId::ANONYMOUS, 8, 11));
     }
 
     #[test]
     fn only_trivia_yields_eof() {
         for input in ["", "   \n\t  \r\n  ", "// line\n/* block */\n"] {
             assert_eq!(
-                lex(input)
+                lex(input, FileId::ANONYMOUS)
                     .unwrap()
                     .into_iter()
                     .map(|t| t.kind)
@@ -903,19 +919,19 @@ mod tests {
 
     #[test]
     fn error_span_points_at_offender() {
-        let e = lex("Health @").unwrap_err();
+        let e = lex("Health @", FileId::ANONYMOUS).unwrap_err();
         assert_eq!(e.kind, LexErrorKind::UnexpectedChar('@'));
-        assert_eq!(e.span, Span { start: 7, end: 8 });
+        assert_eq!(e.span, Span::new(FileId::ANONYMOUS, 7, 8));
     }
 
     // --- eof ------------------------------------------------------------------
 
     #[test]
     fn always_ends_with_eof() {
-        let toks = lex("Health 100;").unwrap();
+        let toks = lex("Health 100;", FileId::ANONYMOUS).unwrap();
         let last = toks.last().unwrap();
         assert_eq!(last.kind, Eof);
         assert_eq!(last.source, "");
-        assert_eq!(last.span, Span { start: 11, end: 11 });
+        assert_eq!(last.span, Span::new(FileId::ANONYMOUS, 11, 11));
     }
 }

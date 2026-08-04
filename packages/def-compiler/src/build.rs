@@ -31,12 +31,14 @@ use defs::binary::{
 use defs::crc32;
 use defs::names::NamesBuilder;
 use defs::text::{
-    DefParseError, Definition, Expr, SourceAst, Span, Spanned, Statement, SymbolTable,
-    TextParseErrorKind, parse_source, symbols::Redefinition,
+    DefParseError, Definition, Expr, FileId, SourceAst, Span, Spanned, Statement, SymbolTable,
+    TextParseErrorKind, parse_source,
+    symbols::{Redefinition, SymbolEvalError},
 };
 
 use crate::lower::{LowerError, flatten_specialization, lower_def};
 use crate::manifest;
+use crate::reader::{DefReaderError, EvalError};
 use crate::walk_def_files;
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -52,15 +54,29 @@ pub struct SourceFile {
     pub text: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Severity {
     Warning,
     Error,
 }
 
-/// A span within a diagnostic's source file, optionally annotated.
-#[derive(Debug, Clone)]
+/// An annotated span, in a named source file.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiagnosticLabel {
+    /// Which file the span is in — an index into `sources`.
+    ///
+    /// Per-label rather than per-diagnostic because one diagnostic can point
+    /// into several files at once. Specialization is the reason: a bad
+    /// statement in a template in `objects.tpl` is inherited by definitions in
+    /// a dozen other files, and the error wants to show both the template and
+    /// the definitions affected.
+    ///
+    /// It is also a correctness fix. When the file lived on the diagnostic, the
+    /// lowering path set it from the *child* definition's file while the span
+    /// came from the *template*, so a cross-file inherited error drew its caret
+    /// at that byte offset in the wrong file — pointing confidently at
+    /// unrelated source.
+    pub source: usize,
     /// `true` for the span the diagnostic is *about*; `false` for supporting
     /// context (e.g. "in this definition").
     pub primary: bool,
@@ -70,25 +86,41 @@ pub struct DiagnosticLabel {
 
 /// One thing the build has to say about the corpus.
 ///
-/// `source` indexes [`BuildReport::sources`] / [`BuildError::sources`]. It is
-/// `None` for diagnostics with no registered source file (header files, which
-/// are not retained), in which case `message` names the file itself.
+/// A diagnostic with no labels has no source location — an I/O failure, or a
+/// statement about the corpus rather than about a byte in it. Otherwise each
+/// label names its own file, so one diagnostic can point into several.
 #[derive(Debug, Clone)]
 pub struct BuildDiagnostic {
     pub severity: Severity,
     pub message: String,
-    pub source: Option<usize>,
     pub labels: Vec<DiagnosticLabel>,
+    /// Trailing explanations, rendered after the source excerpt.
+    ///
+    /// Keeps context out of the headline. `unknown constant` and
+    /// `unknown definition` are the same shape of mistake in two different
+    /// namespaces, and a note is where that distinction belongs — the headline
+    /// should stay short enough to scan.
+    pub notes: Vec<String>,
 }
 
 impl BuildDiagnostic {
+    /// A diagnostic with no source location — an I/O failure, or a statement
+    /// about the corpus as a whole rather than about a byte in it.
     fn bare(severity: Severity, message: String) -> Self {
         Self {
             severity,
             message,
-            source: None,
             labels: Vec::new(),
+            notes: Vec::new(),
         }
+    }
+
+    /// The location this diagnostic is *about*, used for ordering.
+    fn primary_location(&self) -> Option<(usize, usize)> {
+        self.labels
+            .iter()
+            .find(|l| l.primary)
+            .map(|l| (l.source, l.span.start))
     }
 }
 
@@ -227,7 +259,10 @@ pub fn build_with_progress(
     let load_failures = diagnostics.count(Severity::Error);
     if load_failures > 0 {
         return Err(finish(
-            format!("{load_failures} source file(s) failed to load"),
+            format!(
+                "{load_failures} source file{} failed to load",
+                if load_failures == 1 { "" } else { "s" }
+            ),
             corpus.sources,
             &diagnostics,
         ));
@@ -286,8 +321,62 @@ impl Diagnostics {
         self.0.borrow_mut().push(diag);
     }
 
+    /// Drain, merging repeats of one mistake and ordering by source position.
+    ///
+    /// Specialization fan-out is why this exists. `flatten_specialization`
+    /// copies a template's statements into every descendant, so one bad
+    /// statement in a widely-inherited template is lowered once per descendant
+    /// and reported once per descendant — every report with its caret on the
+    /// same byte of the same template, because that is the only place the
+    /// mistake is written. A stock-shaped template can have well over a
+    /// thousand descendants.
+    ///
+    /// The descendants are not labelled, only counted: an inheriting definition
+    /// contains no trace of the problem, so sending the reader there wastes the
+    /// trip. What it does need to know is the blast radius, which is the note.
+    ///
+    /// Genuinely distinct mistakes are untouched: two typos of the same name on
+    /// two different lines have different primary spans and stay separate, and
+    /// both are reported.
+    ///
+    /// Ordering is by (file, offset) so a build reads top-to-bottom per file
+    /// rather than in pipeline order, which interleaved header diagnostics,
+    /// parse errors, and three separate per-binary lowering passes.
     fn take(&self) -> Vec<BuildDiagnostic> {
-        self.0.borrow_mut().split_off(0)
+        /// One mistake: the same message, at the same place, at the same
+        /// severity.
+        type MergeKey = (Severity, Option<(usize, usize, usize)>, String);
+
+        let raw = self.0.borrow_mut().split_off(0);
+        let mut out: Vec<BuildDiagnostic> = Vec::with_capacity(raw.len());
+        let mut seen: HashMap<MergeKey, usize> = HashMap::new();
+        let mut repeats: Vec<usize> = Vec::new();
+        for diag in raw {
+            let primary = diag
+                .labels
+                .iter()
+                .find(|l| l.primary)
+                .map(|l| (l.source, l.span.start, l.span.end));
+            let key = (diag.severity, primary, diag.message.clone());
+            match seen.get(&key) {
+                Some(&i) => repeats[i] += 1,
+                None => {
+                    seen.insert(key, out.len());
+                    repeats.push(0);
+                    out.push(diag);
+                }
+            }
+        }
+        for (diag, repeats) in out.iter_mut().zip(repeats) {
+            if repeats > 0 {
+                diag.notes.push(format!(
+                    "{} other definition(s) inherit this and fail for the same reason",
+                    repeats
+                ));
+            }
+        }
+        out.sort_by_key(|d| d.primary_location());
+        out
     }
 
     fn count(&self, severity: Severity) -> usize {
@@ -643,13 +732,10 @@ fn load_symbols(
             text,
         });
         let text = &sources[sid].text;
-        match parse_source(text) {
+        match parse_source(text, FileId(sid as u32)) {
             Ok(ast) => match symbols.evaluate_items(&ast.items) {
-                Ok(redefined) => report_redefinitions(&display, &redefined, diagnostics),
-                Err(e) => diagnostics.push(BuildDiagnostic::bare(
-                    Severity::Error,
-                    format!("header {display}: evaluate error: {e:?}"),
-                )),
+                Ok(redefined) => report_redefinitions(sid, &redefined, diagnostics),
+                Err(e) => diagnostics.push(symbol_eval_diagnostic(sid, &e)),
             },
             Err(e) => diagnostics.push(parse_error_diagnostic(sid, &e)),
         }
@@ -657,28 +743,52 @@ fn load_symbols(
     symbols
 }
 
+/// A declaration that would not evaluate, pointed at the offending expression.
+fn symbol_eval_diagnostic(source: usize, error: &SymbolEvalError) -> BuildDiagnostic {
+    BuildDiagnostic {
+        severity: Severity::Error,
+        message: format!("{error}"),
+        labels: vec![DiagnosticLabel {
+            source,
+            primary: true,
+            span: error.span(),
+            message: None,
+        }],
+        notes: Vec::new(),
+    }
+}
+
 /// How many redefinitions to name individually before collapsing to a count.
 /// A regenerated header can redefine thousands of symbols at once, and a log
 /// that long buries every other diagnostic.
 const MAX_REPORTED_REDEFINITIONS: usize = 10;
 
-fn report_redefinitions(display: &str, redefined: &[Redefinition], diagnostics: &Diagnostics) {
+fn report_redefinitions(source: usize, redefined: &[Redefinition], diagnostics: &Diagnostics) {
     for r in redefined.iter().take(MAX_REPORTED_REDEFINITIONS) {
-        diagnostics.push(BuildDiagnostic::bare(
-            Severity::Warning,
-            format!(
-                "{display}: symbol {} redefined: {} -> {} (later definition wins)",
+        diagnostics.push(BuildDiagnostic {
+            severity: Severity::Warning,
+            message: format!(
+                "symbol {} redefined: {} -> {} (later definition wins)",
                 r.name, r.previous, r.value
             ),
-        ));
+            labels: vec![DiagnosticLabel {
+                source,
+                primary: true,
+                span: r.span,
+                message: Some(format!("was {}, now {}", r.previous, r.value)),
+            }],
+            notes: Vec::new(),
+        });
     }
     if let Some(rest) = redefined.len().checked_sub(MAX_REPORTED_REDEFINITIONS)
         && rest > 0
     {
-        diagnostics.push(BuildDiagnostic::bare(
-            Severity::Warning,
-            format!("{display}: … and {rest} more symbol(s) redefined"),
-        ));
+        diagnostics.push(BuildDiagnostic {
+            severity: Severity::Warning,
+            message: format!("… and {rest} more symbol(s) redefined in this file"),
+            labels: Vec::new(),
+            notes: Vec::new(),
+        });
     }
 }
 
@@ -738,10 +848,12 @@ fn parse_corpus(
         let raw = std::fs::read(p).map_err(|e| format!("read {p:?}: {e}"))?;
         let text = String::from_utf8_lossy(&raw).into_owned();
         let path = normalize_path(p);
-        match parse_source(&text) {
+        // The id has to be known before parsing, since every span the parse
+        // produces is stamped with it.
+        let sid = sources.len();
+        match parse_source(&text, FileId(sid as u32)) {
             Ok(f) => {
                 let def_count = f.definitions().count();
-                let sid = sources.len();
                 sources.push(SourceFile {
                     path: path.clone(),
                     text,
@@ -781,17 +893,8 @@ fn parse_corpus(
 
     for (&sid, pf) in source_ids.iter().zip(parsed_files.iter()) {
         match symbols.evaluate_items(&pf.def_file.items) {
-            Ok(redefined) => report_redefinitions(&sources[sid].path, &redefined, diagnostics),
-            Err(e) => diagnostics.push(BuildDiagnostic {
-                severity: Severity::Error,
-                message: format!("header evaluation failed: {e:?}"),
-                source: Some(sid),
-                labels: vec![DiagnosticLabel {
-                    primary: false,
-                    span: Span { start: 0, end: 0 },
-                    message: Some("in this file".to_string()),
-                }],
-            }),
+            Ok(redefined) => report_redefinitions(sid, &redefined, diagnostics),
+            Err(e) => diagnostics.push(symbol_eval_diagnostic(sid, &e)),
         }
     }
 
@@ -820,10 +923,13 @@ fn def_header_end(text: &str, start: usize) -> usize {
 /// parser attaches as it unwinds. Both grammars produce the same shape.
 fn parse_error_diagnostic(source: usize, error: &DefParseError) -> BuildDiagnostic {
     let msg = format!("{error}");
+    // No message on the primary label: it would repeat the headline verbatim
+    // directly under it. The caret alone carries the location.
     let mut labels = vec![DiagnosticLabel {
+        source,
         primary: true,
         span: error.span,
-        message: Some(msg.clone()),
+        message: None,
     }];
     if let Some(context) = &error.context {
         // For a missing `#end_definition` the useful statement is about the
@@ -835,6 +941,7 @@ fn parse_error_diagnostic(source: usize, error: &DefParseError) -> BuildDiagnost
             _ => context.label(),
         };
         labels.push(DiagnosticLabel {
+            source,
             primary: false,
             span: context.span,
             message: Some(note),
@@ -843,8 +950,8 @@ fn parse_error_diagnostic(source: usize, error: &DefParseError) -> BuildDiagnost
     BuildDiagnostic {
         severity: Severity::Error,
         message: msg,
-        source: Some(source),
         labels,
+        notes: Vec::new(),
     }
 }
 
@@ -858,36 +965,73 @@ fn lowering_error_diagnostic(
     let Some(sid) = source else {
         return BuildDiagnostic::bare(Severity::Error, format!("{def_type} {def_name}: {error}"));
     };
-    let text = &ctx.sources[sid].text;
     let mut labels = Vec::new();
-    if let Some(span) = error.primary_span() {
+    let primary = error.primary_span();
+    // The span names its own file. That matters here because the statement may
+    // have been inherited: `flatten_specialization` copies a template's
+    // statements into the child, so the span can belong to a different file than
+    // the definition being compiled.
+    if let Some(span) = primary {
         labels.push(DiagnosticLabel {
+            source: span.file.0 as usize,
             primary: true,
             span,
-            message: Some(format!("{error}")),
+            message: None,
         });
     }
-    // Point the "in this definition" note at the name in the header line, not
-    // the whole line, so the caret lands on what identifies the def.
-    if let Some(dspan) = ctx.def_spans.get(def_name) {
+
+    // "in this definition" is only worth saying when the offending text is
+    // *in* this definition.
+    //
+    // If the statement was inherited, this definition does not mention the
+    // problem anywhere — it just specialises something that does. Labelling it
+    // sends the reader to a file where there is nothing to see and nothing to
+    // fix, and a template near the root of the hierarchy would drag in
+    // hundreds of such labels. The count is the useful part, and the merge in
+    // `Diagnostics::take` supplies that.
+    //
+    // Containment is exact now that spans know their file; before, comparing
+    // bare offsets across files was a coin flip.
+    let own_statement = primary.is_some_and(|span| {
+        ctx.def_spans
+            .get(def_name)
+            .is_some_and(|d| d.contains(span))
+    });
+    if own_statement && let Some(dspan) = ctx.def_spans.get(def_name) {
+        // Point at the name in the header line, not the whole line, so the
+        // caret lands on what identifies the def.
+        let text = &ctx.sources[sid].text;
         let header_line = &text[dspan.start..def_header_end(text, dspan.start)];
         if let Some(name_pos) = header_line.find(def_name) {
             let start = dspan.start + name_pos;
             labels.push(DiagnosticLabel {
+                source: sid,
                 primary: false,
-                span: Span {
-                    start,
-                    end: start + def_name.len(),
-                },
+                span: Span::new(dspan.file, start, start + def_name.len()),
                 message: Some("in this definition".to_string()),
             });
         }
     }
+    // Names live in two namespaces that look identical at a use site: constants
+    // come from `enum`/`#define` declarations, definition names from
+    // `#definition`. Saying which one was searched is the difference between
+    // "typo" and "wrong kind of thing entirely".
+    let notes = match error {
+        LowerError::Reader(DefReaderError::Eval(EvalError::UnknownSymbol(_), _)) => {
+            vec!["constants come from `enum` / `#define` declarations".to_string()]
+        }
+        LowerError::UnresolvedReference(..) => {
+            vec![format!(
+                "no `#definition` with this name is in scope for this binary"
+            )]
+        }
+        _ => Vec::new(),
+    };
     BuildDiagnostic {
         severity: Severity::Error,
         message: format!("{error}"),
-        source,
         labels,
+        notes,
     }
 }
 
@@ -1076,7 +1220,10 @@ fn emit_nulldef_and_named(
     if error_count == 0 {
         Ok(n_ok)
     } else {
-        Err(format!("{error_count} error(s)"))
+        Err(format!(
+            "{error_count} definition{} failed to compile",
+            if error_count == 1 { "" } else { "s" }
+        ))
     }
 }
 
@@ -1218,11 +1365,24 @@ fn build_subdefs(
                     b
                 }
                 Err(e) => {
+                    // As on the named path, the span carries its own file: a
+                    // sub-def block can be inherited from a template elsewhere.
+                    let labels = e
+                        .primary_span()
+                        .map(|span| {
+                            vec![DiagnosticLabel {
+                                source: span.file.0 as usize,
+                                primary: true,
+                                span,
+                                message: None,
+                            }]
+                        })
+                        .unwrap_or_default();
                     ctx.diagnostics.push(BuildDiagnostic {
                         severity: Severity::Error,
-                        message: format!("sub-def lowering failed for <{tag}> in {name}: {e}"),
-                        source: ctx.def_to_source.get(name.as_str()).copied(),
-                        labels: Vec::new(),
+                        message: format!("in <{tag}> of {name}: {e}"),
+                        labels,
+                        notes: Vec::new(),
                     });
                     sub_fail += 1;
                     continue;
@@ -1267,7 +1427,10 @@ fn build_subdefs(
         entries[named_base + oi].sub_defs = Some(table);
     }
     if sub_fail > 0 {
-        return Err(format!("{sub_fail} sub-def lowering error(s)"));
+        return Err(format!(
+            "{sub_fail} sub-definition{} failed to compile",
+            if sub_fail == 1 { "" } else { "s" }
+        ));
     }
     let sub_base = entries.len() as u32;
     for e in &mut entries[named_base..] {

@@ -2,7 +2,7 @@ pub mod base;
 pub mod lexer;
 pub mod symbols;
 
-pub use self::base::{LineIndex, ParseContext, Span, Spanned};
+pub use self::base::{FileId, LineIndex, ParseContext, Span, Spanned};
 pub use self::lexer::{LexError, LexErrorKind, Lexer, TextParseErrorKind, Token, TokenKind, lex};
 pub use self::symbols::SymbolTable;
 
@@ -237,29 +237,33 @@ pub struct Call {
 // `enum`s whose symbols exist nowhere else. Nested bodies hold `Item`, so there
 // is one item type for the whole grammar.
 
+// Names and leaf values are `Spanned` so failures found *after* parsing — a
+// symbol that will not evaluate, a redefinition worth reporting — can point at
+// the source instead of naming the file and leaving the reader to grep.
+
 #[derive(Debug, Clone)]
 pub struct EnumDecl {
-    pub name: Option<String>,
+    pub name: Option<Spanned<String>>,
     pub variants: Vec<EnumVariant>,
 }
 
 #[derive(Debug, Clone)]
 pub struct EnumVariant {
-    pub name: String,
+    pub name: Spanned<String>,
     pub value: Option<EnumExpr>,
 }
 
 #[derive(Debug, Clone)]
 pub enum EnumExpr {
-    Int(i64),
-    Ident(String),
+    Int(Spanned<i64>),
+    Ident(Spanned<String>),
     Shift(Vec<EnumExpr>),
     BitOr(Vec<EnumExpr>),
 }
 
 #[derive(Debug, Clone)]
 pub struct Define {
-    pub name: String,
+    pub name: Spanned<String>,
     /// `None` for a valueless `#define NAME`, which C treats as "defined, empty
     /// expansion" rather than a number. The corpus has 46 of these (every
     /// include guard) against 25 with values.
@@ -317,8 +321,8 @@ fn is_body_terminator(kind: TokenKind) -> bool {
 /// meanings depending on the extension: `#ifdef` was a real conditional in a
 /// `.h` and silently-skipped junk in a `.def`, so a guarded `#define` in a
 /// `.def` leaked its symbol unconditionally.
-pub fn parse_source(input: &str) -> Result<SourceAst, DefParseError> {
-    let tokens = lex(input).map_err(|e| {
+pub fn parse_source(input: &str, file: FileId) -> Result<SourceAst, DefParseError> {
+    let tokens = lex(input, file).map_err(|e| {
         let (span, kind) = lex_error_to_parse_error(e);
         ParseError::new(span, kind)
     })?;
@@ -329,7 +333,7 @@ pub fn parse_source(input: &str) -> Result<SourceAst, DefParseError> {
 /// Parse a single expression from `input`. Used by tests that need to evaluate
 /// expressions without going through a full definition.
 pub fn parse_expr_str(input: &str) -> Result<Spanned<Expr>, DefParseError> {
-    let tokens = lex(input).map_err(|e| {
+    let tokens = lex(input, FileId::ANONYMOUS).map_err(|e| {
         let (span, kind) = lex_error_to_parse_error(e);
         ParseError::new(span, kind)
     })?;
@@ -375,7 +379,7 @@ fn parse_file(cursor: &mut Cursor<'_>) -> Result<SourceAst, ParseError<TextParse
                 }
                 end = cursor.bump().span.end;
             }
-            file.ignored.push(Span { start, end });
+            file.ignored.push(Span::new(cursor.file(), start, end));
         }
     }
     Ok(file)
@@ -419,10 +423,11 @@ fn parse_definition(
         let spec_kw = cursor.bump();
         let parent_span_start = cursor.peek().span.start;
         let parent = cursor.expect_ident("specialised parent")?;
-        let spec_span = Span {
-            start: spec_kw.span.start,
-            end: parent_span_start + parent.len(),
-        };
+        let spec_span = Span::new(
+            cursor.file(),
+            spec_kw.span.start,
+            parent_span_start + parent.len(),
+        );
         Some((parent, spec_span))
     } else {
         None
@@ -453,10 +458,7 @@ fn parse_definition(
     };
 
     Ok(Spanned {
-        span: Span {
-            start: def_start,
-            end: def_end,
-        },
+        span: Span::new(cursor.file(), def_start, def_end),
         value: Definition {
             is_template,
             def_type,
@@ -477,10 +479,7 @@ fn parse_statement(
     if cursor.at(TokenKind::Lt) && cursor.peek_at(1).kind != TokenKind::Backslash {
         let tb = parse_tagged_block(cursor)?;
         return Ok(Spanned {
-            span: Span {
-                start: stmt_start,
-                end: cursor.prev_end(),
-            },
+            span: Span::new(cursor.file(), stmt_start, cursor.prev_end()),
             value: Statement::TaggedBlock(tb),
         });
     }
@@ -495,10 +494,7 @@ fn parse_statement(
             cursor.bump();
         }
         return Ok(Spanned {
-            span: Span {
-                start: stmt_start,
-                end: cursor.prev_end(),
-            },
+            span: Span::new(cursor.file(), stmt_start, cursor.prev_end()),
             value: Statement::MethodCall(MethodCall { object, call }),
         });
     }
@@ -509,10 +505,7 @@ fn parse_statement(
         cursor.bump();
     }
     Ok(Spanned {
-        span: Span {
-            start: stmt_start,
-            end: cursor.prev_end(),
-        },
+        span: Span::new(cursor.file(), stmt_start, cursor.prev_end()),
         value: Statement::Field(Field { path, expr }),
     })
 }
@@ -540,10 +533,7 @@ fn parse_tagged_block(
                 // Underline the whole `<\Tag>` closer, which is what disagrees
                 // with the opener.
                 return Err(ParseError::new(
-                    Span {
-                        start: close_start,
-                        end: cursor.prev_end(),
-                    },
+                    Span::new(cursor.file(), close_start, cursor.prev_end()),
                     TextParseErrorKind::MismatchedTag {
                         opened: tag,
                         closed: close_tag,
@@ -614,10 +604,7 @@ fn parse_bitor_expr(
         Ok(terms.pop().unwrap())
     } else {
         Ok(Spanned {
-            span: Span {
-                start,
-                end: cursor.prev_end(),
-            },
+            span: Span::new(cursor.file(), start, cursor.prev_end()),
             value: Expr::BitOr(terms),
         })
     }
@@ -637,10 +624,7 @@ fn parse_add_expr(
         Ok(terms.pop().unwrap())
     } else {
         Ok(Spanned {
-            span: Span {
-                start,
-                end: cursor.prev_end(),
-            },
+            span: Span::new(cursor.file(), start, cursor.prev_end()),
             value: Expr::Add(terms),
         })
     }
@@ -681,10 +665,7 @@ fn parse_leaf_expr(
                     if cursor.at(TokenKind::LParen) {
                         let call = parse_call_with_name(cursor, ident.to_string())?;
                         Ok(Spanned {
-                            span: Span {
-                                start: tok.span.start,
-                                end: cursor.prev_end(),
-                            },
+                            span: Span::new(cursor.file(), tok.span.start, cursor.prev_end()),
                             value: Expr::Constructor(call),
                         })
                     } else {
@@ -782,20 +763,15 @@ fn parse_enum_body(cursor: &mut Cursor<'_>) -> Result<EnumDecl, ParseError<TextP
     // `enum` was already bumped by the caller; anchor on it so an anonymous
     // enum still has something to point at.
     let keyword_span = cursor.prev_span();
-    let name_span = cursor.peek().span;
     let name = if cursor.at(TokenKind::Ident) {
-        Some(cursor.expect_ident("enum name")?)
+        Some(cursor.expect_ident_spanned("enum name")?)
     } else {
         None
     };
     let ctx = ParseContext::new(
         "enum",
-        name.clone(),
-        if name.is_some() {
-            name_span
-        } else {
-            keyword_span
-        },
+        name.as_ref().map(|n| n.value.clone()),
+        name.as_ref().map_or(keyword_span, |n| n.span),
     );
     cursor
         .expect(TokenKind::LBrace)
@@ -854,7 +830,7 @@ fn parse_enum_variants(
 fn parse_enum_variant(
     cursor: &mut Cursor<'_>,
 ) -> Result<EnumVariant, ParseError<TextParseErrorKind>> {
-    let name = cursor.expect_ident("identifier")?;
+    let name = cursor.expect_ident_spanned("identifier")?;
     let value = if cursor.at(TokenKind::Eq) {
         cursor.bump();
         Some(parse_enum_expr(cursor)?)
@@ -905,18 +881,24 @@ fn parse_enum_leaf(cursor: &mut Cursor<'_>) -> Result<EnumExpr, ParseError<TextP
                 .source
                 .parse::<i64>()
                 .map_err(|_| ParseError::new(t.span, TextParseErrorKind::InvalidNumber))?;
-            Ok(EnumExpr::Int(n))
+            Ok(EnumExpr::Int(Spanned {
+                span: t.span,
+                value: n,
+            }))
         }
         TokenKind::Ident => {
             let t = cursor.bump();
-            Ok(EnumExpr::Ident(t.source.to_string()))
+            Ok(EnumExpr::Ident(Spanned {
+                span: t.span,
+                value: t.source.to_string(),
+            }))
         }
         _ => Err(cursor.unexpected("number or identifier")),
     }
 }
 
 fn parse_define_body(cursor: &mut Cursor<'_>) -> Result<Define, ParseError<TextParseErrorKind>> {
-    let name = cursor.expect_ident("identifier")?;
+    let name = cursor.expect_ident_spanned("identifier")?;
     // The value is optional: `#define __FOO_H__` is an include guard, not a
     // malformed constant.
     if !cursor.at(TokenKind::Number) {
@@ -1026,7 +1008,7 @@ mod tests {
 
     fn parse_def(body: &str) -> Spanned<Definition> {
         let input = format!("#definition OBJECT T\n{body}\n#end_definition");
-        parse_source(&input)
+        parse_source(&input, FileId::ANONYMOUS)
             .unwrap()
             .definitions()
             .next()
@@ -1035,7 +1017,7 @@ mod tests {
     }
 
     fn parse_first_def(input: &str) -> Spanned<Definition> {
-        parse_source(input)
+        parse_source(input, FileId::ANONYMOUS)
             .unwrap()
             .definitions()
             .next()
@@ -1044,7 +1026,7 @@ mod tests {
     }
 
     fn parse_err(input: &str) -> TextParseErrorKind {
-        parse_source(input).unwrap_err().inner
+        parse_source(input, FileId::ANONYMOUS).unwrap_err().inner
     }
 
     fn parse_stmt(stmt: &str) -> Spanned<Statement> {
@@ -1315,7 +1297,11 @@ mod tests {
 
     #[test]
     fn end_definition_trailing_semicolon() {
-        let file = parse_source("#definition OBJECT T\n  Health 100;\n#end_definition;").unwrap();
+        let file = parse_source(
+            "#definition OBJECT T\n  Health 100;\n#end_definition;",
+            FileId::ANONYMOUS,
+        )
+        .unwrap();
         assert_eq!(file.definitions().count(), 1);
     }
 
@@ -1329,6 +1315,7 @@ mod tests {
     #definition OBJECT SECOND
     #end_definition
     "#,
+            FileId::ANONYMOUS,
         )
         .unwrap();
         assert_eq!(file.definitions().count(), 2);
@@ -1424,7 +1411,7 @@ mod tests {
             "  Health 200;\n",
             "#end_definition\n",
         );
-        let err = parse_source(input).unwrap_err();
+        let err = parse_source(input, FileId::ANONYMOUS).unwrap_err();
         assert!(matches!(
             err.inner,
             TextParseErrorKind::MissingEndDefinition
@@ -1439,7 +1426,7 @@ mod tests {
 
     #[test]
     fn empty_file() {
-        let f = parse_source("").unwrap();
+        let f = parse_source("", FileId::ANONYMOUS).unwrap();
         assert!(f.items.is_empty());
         assert!(f.ignored.is_empty());
     }
@@ -1447,7 +1434,7 @@ mod tests {
     #[test]
     fn whitespace_only() {
         assert!(
-            parse_source("   \n\t  \n  ")
+            parse_source("   \n\t  \n  ", FileId::ANONYMOUS)
                 .unwrap()
                 .definitions()
                 .next()
@@ -1458,7 +1445,13 @@ mod tests {
     #[test]
     fn comments_only() {
         let input = "// line comment\n/* block\n   comment */\n";
-        assert!(parse_source(input).unwrap().definitions().next().is_none());
+        assert!(
+            parse_source(input, FileId::ANONYMOUS)
+                .unwrap()
+                .definitions()
+                .next()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1485,7 +1478,7 @@ mod tests {
         Health 200;
     #end_definition;
     "#;
-        let file = parse_source(input).unwrap();
+        let file = parse_source(input, FileId::ANONYMOUS).unwrap();
         assert_eq!(file.definitions().count(), 2);
         assert_eq!(file.definitions().next().unwrap().value.name, "FIRST");
         assert_eq!(file.definitions().nth(1).unwrap().value.name, "SECOND");
@@ -1500,11 +1493,11 @@ mod tests {
 
     // ── Declaration items ─────────────────────────────────────────────────
     fn parse_h(input: &str) -> SourceAst {
-        parse_source(input).expect("header parse ok")
+        parse_source(input, FileId::ANONYMOUS).expect("header parse ok")
     }
 
     fn parse_h_err(input: &str) -> TextParseErrorKind {
-        parse_source(input).unwrap_err().inner
+        parse_source(input, FileId::ANONYMOUS).unwrap_err().inner
     }
 
     /// An include guard is ordinary structure, not a prologue to skip: a
@@ -1544,12 +1537,18 @@ mod tests {
         let Item::Enum(decl) = &h.items[0] else {
             panic!()
         };
-        assert_eq!(decl.name.as_deref(), Some("EFoo"));
+        assert_eq!(decl.name.as_ref().map(|n| n.value.as_str()), Some("EFoo"));
         assert_eq!(decl.variants.len(), 2);
-        assert_eq!(decl.variants[0].name, "A");
-        assert!(matches!(decl.variants[0].value, Some(EnumExpr::Int(1))));
-        assert_eq!(decl.variants[1].name, "B");
-        assert!(matches!(decl.variants[1].value, Some(EnumExpr::Int(2))));
+        assert_eq!(decl.variants[0].name.value, "A");
+        assert!(matches!(
+            decl.variants[0].value,
+            Some(EnumExpr::Int(Spanned { value: 1, .. }))
+        ));
+        assert_eq!(decl.variants[1].name.value, "B");
+        assert!(matches!(
+            decl.variants[1].value,
+            Some(EnumExpr::Int(Spanned { value: 2, .. }))
+        ));
     }
 
     #[test]
@@ -1568,9 +1567,15 @@ mod tests {
         let Item::Enum(decl) = &h.items[0] else {
             panic!()
         };
-        assert!(matches!(decl.variants[0].value, Some(EnumExpr::Int(1))));
+        assert!(matches!(
+            decl.variants[0].value,
+            Some(EnumExpr::Int(Spanned { value: 1, .. }))
+        ));
         assert!(decl.variants[1].value.is_none()); // B = 2 (auto)
-        assert!(matches!(decl.variants[2].value, Some(EnumExpr::Int(5))));
+        assert!(matches!(
+            decl.variants[2].value,
+            Some(EnumExpr::Int(Spanned { value: 5, .. }))
+        ));
         assert!(decl.variants[3].value.is_none()); // D = 6 (auto)
     }
 
@@ -1582,7 +1587,7 @@ mod tests {
         };
         assert!(matches!(
             &decl.variants[0].value,
-            Some(EnumExpr::Ident(s)) if s == "NO_SOUND_TYPES"
+            Some(EnumExpr::Ident(s)) if s.value == "NO_SOUND_TYPES"
         ));
     }
 
@@ -1629,7 +1634,7 @@ mod tests {
         let Item::Define(d) = &h.items[0] else {
             panic!()
         };
-        assert_eq!(d.name, "FOO");
+        assert_eq!(d.name.value, "FOO");
         assert_eq!(d.value, Some(42));
     }
 
@@ -1746,7 +1751,7 @@ mod tests {
         let Item::Define(d) = &h.items[0] else {
             panic!()
         };
-        assert_eq!(d.name, "FOO");
+        assert_eq!(d.name.value, "FOO");
         assert_eq!(d.value, None);
         assert_eq!(h.ignored.len(), 1);
     }

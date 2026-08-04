@@ -112,7 +112,7 @@ pub enum EvalError {
 impl std::fmt::Display for EvalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            EvalError::UnknownSymbol(s) => write!(f, "unknown symbol {s}"),
+            EvalError::UnknownSymbol(s) => write!(f, "unknown constant `{s}`"),
             EvalError::OutOfRange(n) => write!(f, "value {n} out of range"),
             EvalError::Overflow => f.write_str("arithmetic overflow"),
             EvalError::InvalidNumber(s) => write!(f, "invalid number {s}"),
@@ -367,7 +367,7 @@ impl<'e, 's> Args<'e, 's> {
     fn get(&self, idx: usize) -> Result<&'e Spanned<Expr>, DefReaderError> {
         self.args
             .get(idx)
-            .ok_or(DefReaderError::MissingArg(idx, Span { start: 0, end: 0 }))
+            .ok_or(DefReaderError::MissingArg(idx, Span::SYNTHETIC))
     }
 
     pub fn i32(&self, idx: usize) -> Result<i32, DefReaderError> {
@@ -441,7 +441,15 @@ impl std::fmt::Display for DefReaderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DefReaderError::MissingField(name, _) => write!(f, "missing required field {name}"),
-            DefReaderError::UnexpectedStatement(_) => f.write_str("unexpected statement"),
+            // Name the field. "unexpected statement" left the reader to work
+            // out which of a group's statements was the problem.
+            DefReaderError::UnexpectedStatement(stmt) => match &stmt.value {
+                Statement::Field(field) => write!(f, "unknown field {}", field.path),
+                Statement::MethodCall(mc) => {
+                    write!(f, "unknown method {}.{}", mc.object, mc.call.name)
+                }
+                Statement::TaggedBlock(tb) => write!(f, "unexpected <{}> block", tb.tag),
+            },
             DefReaderError::MissingArg(i, _) => write!(f, "missing argument at index {i}"),
             DefReaderError::Eval(e, _) => write!(f, "{e}"),
             DefReaderError::Semantic(msg, _) => f.write_str(msg),
@@ -742,10 +750,7 @@ impl<'a, 's> DefReader<'a, 's> {
                 }
             }
         }
-        found.ok_or(DefReaderError::MissingField(
-            "(any)",
-            Span { start: 0, end: 0 },
-        ))
+        found.ok_or(DefReaderError::MissingField("(any)", Span::SYNTHETIC))
     }
 
     pub fn any_i32(&mut self) -> Result<i32, DefReaderError> {
@@ -825,7 +830,7 @@ mod eval_tests {
 
     fn no_span<T>(value: T) -> Spanned<T> {
         Spanned {
-            span: defs::def::text::Span { start: 0, end: 0 },
+            span: defs::def::text::Span::SYNTHETIC,
             value,
         }
     }

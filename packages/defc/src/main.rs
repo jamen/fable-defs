@@ -43,25 +43,28 @@ fn render(files: &SimpleFiles<&str, &str>, diagnostics: &[BuildDiagnostic]) {
             Severity::Error => Diagnostic::error(),
         }
         .with_message(&diag.message);
-        if let Some(source) = diag.source {
-            rendered = rendered.with_labels(
-                diag.labels
-                    .iter()
-                    .map(|l| {
-                        let range = l.span.start..l.span.end;
-                        let label = if l.primary {
-                            Label::primary(source, range)
-                        } else {
-                            Label::secondary(source, range)
-                        };
-                        match &l.message {
-                            Some(m) => label.with_message(m),
-                            None => label,
-                        }
-                    })
-                    .collect(),
-            );
+        if !diag.notes.is_empty() {
+            rendered = rendered.with_notes(diag.notes.clone());
         }
+        // Each label names its own file, so one diagnostic can span several —
+        // a template and the definitions that inherit from it.
+        rendered = rendered.with_labels(
+            diag.labels
+                .iter()
+                .map(|l| {
+                    let range = l.span.start..l.span.end;
+                    let label = if l.primary {
+                        Label::primary(l.source, range)
+                    } else {
+                        Label::secondary(l.source, range)
+                    };
+                    match &l.message {
+                        Some(m) => label.with_message(m),
+                        None => label,
+                    }
+                })
+                .collect(),
+        );
         let _ = term::emit_to_write_style(
             &mut StylesWriter::new(writer.lock(), &styles),
             &config,
