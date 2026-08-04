@@ -11,7 +11,7 @@
 //! parent-first ([`specialization_chain`] + [`Body::Chain`]) so later statements
 //! override earlier ones, and list-building method calls accumulate in order.
 
-use crate::reader::{Args, Body, DefReader, DefReaderError, EvalError, Evaluator};
+use crate::reader::{Args, Body, DefReader, DefReaderError, EvalError, Evaluator, statement_path};
 use defs::names::NamesBuilder;
 use defs::{
     crc32,
@@ -251,10 +251,8 @@ fn filter_out_field<'a>(body: Body<'a>, field: &str) -> Vec<&'a Spanned<Statemen
 fn filter_out_fields<'a>(body: Body<'a>, fields: &[&str]) -> Vec<&'a Spanned<Statement>> {
     body.iter()
         .filter(|stmt| {
-            let segs = match &stmt.value {
-                Statement::MethodCall(mc) => &mc.object.segments,
-                Statement::Field(f) => &f.path.segments,
-                _ => return true,
+            let Some(segs) = statement_path(stmt) else {
+                return true;
             };
             !matches!(segs.first(), Some(PathSegment::Field(n)) if fields.contains(&n.as_str()))
         })
@@ -811,12 +809,7 @@ pub fn lower_generic<T: VisitFields + Clone>(
 /// a parent's `Add`s precede a child's `clear()`.
 fn strip_superseded_by_clear<'a>(body: Body<'a>) -> Option<Vec<&'a Spanned<Statement>>> {
     fn field_name(st: &Spanned<Statement>) -> Option<&str> {
-        let segs = match &st.value {
-            Statement::MethodCall(mc) => &mc.object.segments,
-            Statement::Field(f) => &f.path.segments,
-            _ => return None,
-        };
-        match segs.first() {
+        match statement_path(st)?.first() {
             Some(PathSegment::Field(n)) => Some(n.as_str()),
             _ => None,
         }

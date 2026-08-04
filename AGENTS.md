@@ -1287,9 +1287,20 @@ Measured and set aside, so nobody re-derives them:
 
 ### Track C — Quality
 
-- **Unit tests for `lower.rs`** — 3,350 lines, **zero** tests. The bespoke arms (ctor arg
-  remapping, DSL replay, sort/dedup fixups) rely entirely on the golden end-to-end gate.
-  Prerequisite for Track B's error-propagation work.
+- **Unit tests for `lower.rs`** — 3,400 lines, **zero** tests, the largest untested file in the
+  workspace (`binary.rs` at 1,300 is second). The bespoke arms (ctor arg remapping, DSL replay,
+  sort/dedup fixups) rely entirely on the golden end-to-end gate. Prerequisite for Track B's
+  error-propagation work.
+- **Bundle lowering's three context arguments.** `symbols: &SymbolTable`,
+  `def_indices: &HashMap<String, u32>` and `names: &RefCell<NamesBuilder>` are threaded together
+  through **29 signatures and 52 call sites** and always travel as a unit. A plain
+  `LowerCtx<'a>` struct of three references would remove ~80 sites of repetition at zero runtime
+  cost.
+
+  > This is **not** the rejected `LowerEnv` (§9 A.6). That was a *trait* abstracting how
+  > references resolve; this only groups three parameters. Worth doing on its own merits, and it
+  > happens to be exactly the seam §9 A.4 would change if the compile/link split is ever built —
+  > which is a reason to keep it a plain struct, not to make it clever.
 - **A `NameRef` arm for the semantic ledger** — the blind spot that hid the 260-entry
   ClassIndex bug (§4.7).
 - **Enum typing** — a few fields remain `i32`/`u32` where a `DefEnum`/`DefFlags` exists. All
@@ -1298,6 +1309,20 @@ Measured and set aside, so nobody re-derives them:
   §4.5's B and D categories out of code.
 - **Container-layer error unification** — adopt the wire layer's composable context wrapping
   (§4.7).
+
+**Deliberate non-fixes**, so they are not "cleaned up" later:
+
+- **The two renderers duplicate ~40 lines.** `defc/main.rs` and `def-compiler-sys` each convert
+  `BuildDiagnostic` into a `codespan-reporting` `Diagnostic` and build a `SimpleFiles` store.
+  Sharing that would put `codespan-reporting` in `def-compiler`, which is exactly the coupling §5
+  avoids: the library collects diagnostics and never renders, so consumers stay free to render
+  however they like. Two small copies is the cheaper side of that trade.
+- **`&mut &mut [u8]` in the wire layer** (31 sites, flagged by `clippy::pedantic`) is the
+  serialize cursor, not an oversight.
+- **`clippy::pedantic` is not adopted wholesale.** Run it to *find* things — it surfaced the
+  dead code and the triplicated statement-path match — but most of its output here is
+  `# Errors` doc sections, `#[must_use]`, and "more than 3 bools in a struct", which is the wire
+  format describing itself. Cherry-pick; do not add a lint block to satisfy it.
 
 ---
 

@@ -14,6 +14,21 @@ use defs::def::text::{
     Call, Expr, PathSegment, Span, Spanned, Statement, SymbolTable, number_is_float,
 };
 
+/// The property path a statement is addressed by: a field's own path, or the
+/// object a method is called on. Tagged blocks are addressed by tag rather than
+/// by path, so they have none.
+///
+/// Spelled out rather than wildcarded on purpose: a fourth [`Statement`] variant
+/// should have to decide what its path is, not inherit "none" silently from
+/// three separate copies of this match.
+pub(crate) fn statement_path(stmt: &Spanned<Statement>) -> Option<&[PathSegment]> {
+    match &stmt.value {
+        Statement::Field(field) => Some(&field.path.segments),
+        Statement::MethodCall(mc) => Some(&mc.object.segments),
+        Statement::TaggedBlock(_) => None,
+    }
+}
+
 /// If `stmt` is a leaf field whose path is exactly `name` at `depth` (i.e. ends there), return its
 /// value expression. Used by the by-name leaf accessors so the path-matching lives in one place.
 fn leaf_field<'a>(
@@ -231,8 +246,9 @@ impl<'s> Evaluator<'s> {
 
     pub fn string<'e>(&self, expr: &'e Spanned<Expr>) -> Result<&'e str, EvalError> {
         match &expr.value {
-            Expr::String(s) => Ok(s),
-            Expr::Symbol(s) => Ok(s),
+            // A bare symbol in a string field is its own text — the corpus
+            // writes plain identifiers where a name is wanted.
+            Expr::String(s) | Expr::Symbol(s) => Ok(s),
             other => Err(EvalError::TypeMismatch {
                 expected: "a string",
                 found: expr_kind_name(other),
@@ -726,10 +742,8 @@ impl<'a, 's> DefReader<'a, 's> {
             // Both leaf sub-fields (`Reaction[0].Animation …`) and method calls
             // on a sub-field (`Reaction[0].Attitudes.Add(…)`) belong to the
             // indexed element — group by the object/path segments of either.
-            let segs = match &entry.stmt.value {
-                Statement::Field(field) => &field.path.segments,
-                Statement::MethodCall(mc) => &mc.object.segments,
-                _ => continue,
+            let Some(segs) = statement_path(entry.stmt) else {
+                continue;
             };
             if segs.len() >= self.depth + 2
                 && matches!(segs.get(self.depth), Some(PathSegment::Field(n)) if n == name)
