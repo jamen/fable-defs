@@ -152,13 +152,17 @@ macro_rules! base_or_default {
 
 // ── Specialization ───────────────────────────────────────────────────────────
 
-/// Flatten a definition's `specialises` chain into a single statement list,
-/// most-distant ancestor first. With the reader's last-wins override semantics
-/// this reproduces the game compiler's copy-parent-then-apply behaviour.
-pub fn flatten_specialization<'a>(
+/// A definition's `specialises` chain, **most-distant ancestor first**, ending
+/// with `def` itself.
+///
+/// Separate from [`flatten_specialization`] because walking the chain is cheap
+/// and concatenating it is not — the flattened corpus is 7× larger than the
+/// definitions' own bodies (§1). Callers that only need to *look at* the chain's
+/// statements should walk this and borrow, not flatten and clone.
+pub fn specialization_chain<'a>(
     def: &'a Definition,
-    defs_by_name: &'a HashMap<&str, &Definition>,
-) -> Result<Vec<Spanned<Statement>>, LowerError> {
+    defs_by_name: &HashMap<&str, &'a Definition>,
+) -> Result<Vec<&'a Definition>, LowerError> {
     let mut chain: Vec<&Definition> = vec![def];
     let mut current = def;
     while let Some(parent_name) = &current.specializes {
@@ -179,11 +183,23 @@ pub fn flatten_specialization<'a>(
         chain.push(parent);
         current = parent;
     }
-    Ok(chain
-        .iter()
-        .rev()
-        .flat_map(|d| d.body.iter().cloned())
-        .collect())
+    chain.reverse();
+    Ok(chain)
+}
+
+/// Flatten a definition's `specialises` chain into a single statement list,
+/// most-distant ancestor first. With the reader's last-wins override semantics
+/// this reproduces the game compiler's copy-parent-then-apply behaviour.
+pub fn flatten_specialization<'a>(
+    def: &'a Definition,
+    defs_by_name: &HashMap<&str, &'a Definition>,
+) -> Result<Vec<Spanned<Statement>>, LowerError> {
+    Ok(flatten_chain(&specialization_chain(def, defs_by_name)?))
+}
+
+/// Concatenate the bodies of an already-resolved [`specialization_chain`].
+pub fn flatten_chain(chain: &[&Definition]) -> Vec<Spanned<Statement>> {
+    chain.iter().flat_map(|d| d.body.iter().cloned()).collect()
 }
 
 /// Partition a body by extracting all statements that are method calls on a

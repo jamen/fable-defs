@@ -36,7 +36,7 @@ use defs::text::{
     symbols::{Redefinition, SymbolEvalError},
 };
 
-use crate::lower::{LowerError, flatten_specialization, lower_def};
+use crate::lower::{LowerError, flatten_chain, lower_def, specialization_chain};
 use crate::manifest;
 use crate::reader::{DefReaderError, EvalError};
 use crate::walk_def_files;
@@ -1120,12 +1120,50 @@ fn next_class_index(counters: &mut HashMap<String, u32>, class_name: &str) -> u3
     index
 }
 
-fn emit_nulldef_and_named(
+/// One named def's tagged blocks, merged across its specialization chain and
+/// ordered by tag CRC — the input [`build_subdefs`] lowers.
+///
+/// Collected during the named pass, off the specialization chain that pass has
+/// already resolved: re-deriving them in `build_subdefs` meant walking *and
+/// flattening* the chain a second time for every definition (345 ms). The
+/// statements are **borrowed** from the parsed ASTs — a merged block is a list
+/// of slices, concatenated only when it is about to be lowered, so nothing is
+/// retained for the whole build.
+type SubDefBlocks<'a> = Vec<(u32, &'a str, MergedBlock<'a>)>;
+
+/// One tag's bodies, in parent-first order, still borrowed from the ASTs.
+type MergedBlock<'a> = Vec<&'a [Spanned<Statement>]>;
+
+/// Merge same-tag tagged blocks across a specialization chain, parent-first,
+/// ordered by tag CRC.
+fn collect_sub_def_blocks<'a>(chain: &[&'a Definition]) -> SubDefBlocks<'a> {
+    let mut blocks: HashMap<u32, (&'a str, MergedBlock<'a>)> = HashMap::new();
+    for def in chain {
+        for st in &def.body {
+            if let Statement::TaggedBlock(tb) = &st.value {
+                blocks
+                    .entry(crc32::crc(tb.tag.as_bytes()))
+                    .or_insert_with(|| (tb.tag.as_str(), Vec::new()))
+                    .1
+                    .push(tb.body.as_slice());
+            }
+        }
+    }
+    let mut out: SubDefBlocks<'a> = blocks
+        .into_iter()
+        .map(|(crc, (tag, bodies))| (crc, tag, bodies))
+        .collect();
+    out.sort_by_key(|(crc, _, _)| *crc);
+    out
+}
+
+fn emit_nulldef_and_named<'a>(
     entries: &mut Vec<Built>,
     nulldef_entries: &[&str],
     named_order: &[String],
-    ctx: &BuildCtx,
+    ctx: &BuildCtx<'a>,
     class_index: &mut HashMap<String, u32>,
+    sub_blocks: &mut Vec<SubDefBlocks<'a>>,
 ) -> Result<usize, String> {
     for &class_name in nulldef_entries {
         let fnm = format!("NULLDEF_{class_name}");
@@ -1170,8 +1208,8 @@ fn emit_nulldef_and_named(
         let def_name_off = ctx.names.borrow_mut().intern(&def_type);
         let file_name_off = ctx.names.borrow_mut().intern(name);
 
-        let body = match flatten_specialization(def, ctx.defs_by_name) {
-            Ok(b) => b,
+        let chain = match specialization_chain(def, ctx.defs_by_name) {
+            Ok(c) => c,
             Err(e) => {
                 ctx.diagnostics
                     .push(lowering_error_diagnostic(name, &def_type, &e, ctx));
@@ -1179,6 +1217,7 @@ fn emit_nulldef_and_named(
                 continue;
             }
         };
+        let body = flatten_chain(&chain);
 
         let lowered = match lower_def(
             &def_type,
@@ -1200,6 +1239,16 @@ fn emit_nulldef_and_named(
             }
         };
         let counter = next_class_index(class_index, &def_type);
+        let has_sub_defs = def_name_has_subdef_table(&def_type);
+        // `build_subdefs` has to run after every named entry exists — sub-def
+        // entries follow them in the index space and in the `ClassIndex`
+        // counters — so hand it the merged blocks off this chain rather than
+        // making it re-resolve and re-flatten every definition.
+        sub_blocks.push(if has_sub_defs {
+            collect_sub_def_blocks(&chain)
+        } else {
+            SubDefBlocks::new()
+        });
         entries.push(Built {
             def_name_off,
             file_name_off,
@@ -1209,11 +1258,7 @@ fn emit_nulldef_and_named(
                 is_template: false,
                 unknown_0: 1,
             },
-            sub_defs: if def_name_has_subdef_table(&def_type) {
-                Some(Vec::new())
-            } else {
-                None
-            },
+            sub_defs: if has_sub_defs { Some(Vec::new()) } else { None },
             body: lowered,
         });
     }
@@ -1318,51 +1363,37 @@ fn assemble_and_write(
 //  Phase 2: Build one binary
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Build the anonymous sub-def region (game.bin only).  Merges same-tag tagged
-/// blocks across the specialization chain, lowers each sub-def, deduplicates
-/// anonymous entries by (class-tag, bytes), and appends them to `entries`.
+/// Build the anonymous sub-def region (game.bin only).  Lowers each merged
+/// tagged block (see [`extract_sub_def_blocks`]), deduplicates anonymous
+/// entries by (class-tag, bytes), and appends them to `entries`.
 fn build_subdefs(
     named_order: &[String],
     named_base: usize,
     ctx: &BuildCtx,
     entries: &mut Vec<Built>,
     class_index: &mut HashMap<String, u32>,
+    sub_blocks: &[SubDefBlocks],
 ) -> Result<(usize, usize), String> {
     let mut sub_dedup: HashMap<(String, Vec<u8>), u32> = HashMap::new();
     let mut sub_entries: Vec<Built> = Vec::new();
     let (mut sub_ok, mut sub_fail) = (0, 0);
     for (oi, name) in named_order.iter().enumerate() {
         let owner_index = (named_base + oi) as u32;
-        let Some(def) = ctx.defs_by_name.get(name.as_str()) else {
-            continue;
-        };
-        if !def_name_has_subdef_table(&def.def_type) {
-            continue;
-        }
-        let Ok(body) = flatten_specialization(def, ctx.defs_by_name) else {
-            continue;
-        };
-        let mut blocks: HashMap<u32, (String, Vec<Spanned<Statement>>)> = HashMap::new();
-        for st in &body {
-            if let Statement::TaggedBlock(tb) = &st.value {
-                blocks
-                    .entry(crc32::crc(tb.tag.as_bytes()))
-                    .and_modify(|(_, b)| b.extend(tb.body.iter().cloned()))
-                    .or_insert_with(|| (tb.tag.clone(), tb.body.clone()));
-            }
-        }
+        let blocks = &sub_blocks[oi];
         if blocks.is_empty() {
             continue;
         }
         let mut table: Vec<SubDefRecord> = Vec::new();
-        let mut keys: Vec<u32> = blocks.keys().copied().collect();
-        keys.sort();
-        for k in keys {
-            let (tag, blk) = &blocks[&k];
+        for (k, tag, bodies) in blocks {
+            let k = *k;
+            let tag = *tag;
+            // Concatenated only here, and dropped before the next block.
+            let blk: Vec<Spanned<Statement>> =
+                bodies.iter().flat_map(|b| b.iter().cloned()).collect();
             let lowered = match lower_def(
                 tag,
-                ctx.nulldefs.get(tag.as_str()).as_ref().copied(),
-                blk,
+                ctx.nulldefs.get(tag).as_ref().copied(),
+                &blk,
                 ctx.symbols,
                 ctx.def_indices,
                 ctx.names,
@@ -1403,7 +1434,7 @@ fn build_subdefs(
                 }
             }
             let sub_idx = *sub_dedup
-                .entry((tag.clone(), bytes.clone()))
+                .entry((tag.to_string(), bytes.clone()))
                 .or_insert_with(|| {
                     let idx = sub_entries.len() as u32;
                     let counter = next_class_index(class_index, tag);
@@ -1514,12 +1545,17 @@ fn build_one_bin(
     // emission passes so it runs continuously in global-index order. See
     // `next_class_index`.
     let mut class_index: HashMap<String, u32> = HashMap::new();
+    // Filled by the named pass, consumed by `build_subdefs` — parallel to
+    // `named_order`, which holds because a failure in the named pass aborts the
+    // build before `build_subdefs` runs.
+    let mut sub_blocks: Vec<SubDefBlocks> = Vec::with_capacity(named_order.len());
     let lowered = emit_nulldef_and_named(
         &mut entries,
         config.nulldef_entries,
         &named_order,
         &ctx,
         &mut class_index,
+        &mut sub_blocks,
     )?;
 
     let named_base = nulldef_count as usize;
@@ -1530,6 +1566,7 @@ fn build_one_bin(
             &ctx,
             &mut entries,
             &mut class_index,
+            &sub_blocks,
         )?
     } else {
         (0, 0)
