@@ -1,9 +1,3 @@
-//! Command-line front end for [`def_compiler::build`].
-//!
-//! All the compiler lives in `def-compiler`; this binary owns only the CLI
-//! particulars — argument parsing, progress output, rendering the returned
-//! diagnostics through `codespan-reporting`, and the process exit code.
-
 use std::path::PathBuf;
 
 use codespan_reporting::diagnostic::{Diagnostic, Label};
@@ -14,21 +8,17 @@ use def_compiler::{BuildDiagnostic, Progress, Severity, SourceFile};
 /// Fable def compiler
 #[derive(argh::FromArgs)]
 struct Args {
-    /// print version and exit
-    // Never read: `--version` is handled in `main` before argh runs, because
-    // argh would reject it for missing the required positionals. Declared so
-    // `--help` documents the flag.
-    #[allow(dead_code)]
-    #[argh(switch)]
-    version: bool,
-
     /// input directory containing .def, .tpl, and .h files
-    #[argh(positional)]
-    source: PathBuf,
+    #[argh(option, short = 'i')]
+    source: Option<PathBuf>,
 
     /// output directory for .bin files
-    #[argh(positional)]
-    output: PathBuf,
+    #[argh(option, short = 'o')]
+    output: Option<PathBuf>,
+
+    /// print version and exit
+    #[argh(switch)]
+    version: bool,
 }
 
 /// Mirror the library's source list into a `codespan-reporting` file store so
@@ -83,15 +73,30 @@ fn render(files: &SimpleFiles<&str, &str>, diagnostics: &[BuildDiagnostic]) {
 }
 
 fn main() {
-    // Handled before argh, not through it: `source` and `output` are required
-    // positionals, so `defc --version` on its own fails to parse. The `version`
-    // switch on `Args` exists so `--help` still lists it.
-    if std::env::args().any(|a| a == "--version") {
+    let args: Args = argh::from_env();
+
+    if args.version {
         println!("defc {}", env!("DEFC_VERSION"));
         return;
     }
 
-    let args: Args = argh::from_env();
+    let mut missing = Vec::new();
+    if args.source.is_none() {
+        missing.push("--input / -i");
+    }
+    if args.output.is_none() {
+        missing.push("--output / -o");
+    }
+    if !missing.is_empty() {
+        eprintln!("Required options not provided:");
+        for m in &missing {
+            eprintln!("    {m}");
+        }
+        eprintln!("\nRun defc --help for more information.");
+        std::process::exit(1);
+    }
+    let source = args.source.unwrap();
+    let output = args.output.unwrap();
 
     let mut on_progress = |event: Progress| match event {
         Progress::FileParsed { path, definitions } => {
@@ -116,7 +121,7 @@ fn main() {
         }
     };
 
-    match def_compiler::build_with_progress(&args.source, &args.output, &mut on_progress) {
+    match def_compiler::build_with_progress(&source, &output, &mut on_progress) {
         Ok(report) => {
             render(&file_store(&report.sources), &report.diagnostics);
             let summary: Vec<String> = report

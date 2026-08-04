@@ -11,13 +11,15 @@ This project is experimental. Please report any bugs you find or suggest improve
 ## Usage
 
 ```
-Usage: defc [--] <source> <output>
+Usage: defc [-i <source>] [-o <output>] [--version]
 
 Fable def compiler
 
-Positional Arguments:
-  source            input directory containing .def, .tpl, and .h files
-  output            output directory for .bin files
+Options:
+  -i, --source      input directory containing .def, .tpl, and .h files
+  -o, --output      output directory for .bin files
+  --version         print version and exit
+  --help, help      display usage information
 ```
 
 ## License
