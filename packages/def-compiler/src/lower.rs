@@ -48,6 +48,7 @@ use defs::{
         wire::{DefIndex, DefString, PString, VecMap, WStr},
     },
 };
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -788,7 +789,7 @@ pub fn lower_generic<T: VisitFields + Clone>(
 /// call. The `clear()` itself is kept so `apply_vec_named`/`apply_map_named`
 /// also wipe the NULLDEF base defaults. Critical for merged tagged blocks where
 /// a parent's `Add`s precede a child's `clear()`.
-fn strip_superseded_by_clear(body: &[Spanned<Statement>]) -> Vec<Spanned<Statement>> {
+fn strip_superseded_by_clear(body: &[Spanned<Statement>]) -> Cow<'_, [Spanned<Statement>]> {
     fn field_name(st: &Spanned<Statement>) -> Option<&str> {
         let segs = match &st.value {
             Statement::MethodCall(mc) => &mc.object.segments,
@@ -810,17 +811,23 @@ fn strip_superseded_by_clear(body: &[Spanned<Statement>]) -> Vec<Spanned<Stateme
             last_clear.insert(f, i);
         }
     }
+    // The overwhelmingly common case: no `clear()` anywhere in the body, so
+    // there is nothing to strip. Borrow rather than clone — this runs for every
+    // definition, and cloning the flattened body here cost as much as flattening
+    // it did (681k statement clones across the corpus).
     if last_clear.is_empty() {
-        return body.to_vec();
+        return Cow::Borrowed(body);
     }
-    body.iter()
-        .enumerate()
-        .filter(|(i, st)| match field_name(st) {
-            Some(f) => last_clear.get(f).is_none_or(|&cp| *i >= cp),
-            None => true,
-        })
-        .map(|(_, st)| st.clone())
-        .collect()
+    Cow::Owned(
+        body.iter()
+            .enumerate()
+            .filter(|(i, st)| match field_name(st) {
+                Some(f) => last_clear.get(f).is_none_or(|&cp| *i >= cp),
+                None => true,
+            })
+            .map(|(_, st)| st.clone())
+            .collect(),
+    )
 }
 
 struct Applier<'r, 'a, 's, 'd, 'n> {
