@@ -773,18 +773,25 @@ impl<'a, 's> DefReader<'a, 's> {
         self.eval.eval_bool(expr)
     }
 
-    // ── finish / remaining ──────────────────────────────────────────────────
+    // ── finish ──────────────────────────────────────────────────────────────
 
-    /// Return every unconsumed statement.  Call after the field walk so the
-    /// caller can emit a diagnostic for each misspelled / extraneous field
-    /// name (a silent no-op before this method existed).
-    pub fn remaining_statements(&self) -> Vec<Spanned<Statement>> {
-        self.entries
-            .iter()
-            .filter(|e| !e.consumed)
-            .map(|e| e.stmt.clone())
-            .collect()
-    }
+    // There was once a `remaining_statements()` returning every unconsumed
+    // statement, so `lower_def` could hand them back for the builder to warn
+    // about. It was removed because the question it answers is the wrong one:
+    // it reports what *this reader* did not consume, but consumption is spread
+    // across several readers and several pipeline stages. Tagged blocks are
+    // consumed by the sub-def pass, `Components.Add` by `build_thing_components`,
+    // and the bespoke UI/CONTROL_SCHEME arms run a second full-body reader over
+    // statements the generic pass already took. Measured on the stock corpus it
+    // produced 103,467 "unconsumed" statements of which 10 were real — so the
+    // warning was never turned on, and the channel sat dead.
+    //
+    // Reviving it needs a build-scoped consumption ledger keyed on statement
+    // identity and checked once at the end, not a `Vec` returned per reader.
+    //
+    // `finish()` below is a different thing and is live: it validates a *group*
+    // sub-reader (a Vec element, map value, or indexed sub-struct), where the
+    // reader really does own every statement it was handed.
 
     pub fn finish(self) -> Result<(), DefReaderError> {
         match self.entries.iter().find(|e| !e.consumed) {

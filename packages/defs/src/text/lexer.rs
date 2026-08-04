@@ -20,6 +20,7 @@
 
 use super::base::{ParseError, Span};
 use derive_more::{Display, Error};
+use std::borrow::Cow;
 
 /// A lexical token kind. Flat, `Copy`, payload-free — the raw text lives in
 /// [`Token::source`] and the span in [`Token::span`] (§11.3).
@@ -93,10 +94,21 @@ pub struct LexError {
 /// (P1.3 — merged `DefParseErrorKind` and `HeaderParseErrorKind`).
 #[derive(Debug, Display)]
 pub enum TextParseErrorKind {
-    #[display("expected {expected}")]
-    UnexpectedToken { expected: String },
+    /// `expected` names what the grammar wanted here; `found` is filled in
+    /// uniformly by the `Display` impl, so no construction site formats its own
+    /// "found …" half. `Cow` because most sites are literals and two are not.
+    #[display("expected {expected}, found {}", describe(*found))]
+    UnexpectedToken {
+        expected: Cow<'static, str>,
+        found: TokenKind,
+    },
     #[display("missing #end_definition")]
     MissingEndDefinition,
+    /// `Foo[0](args)` — the path ends in an index, so there is no name to call.
+    /// Not an `UnexpectedToken`: the token under the cursor (`(`) is fine, it is
+    /// the path in front of it that is wrong.
+    #[display("method call has no method name: the path ends in an index")]
+    MethodNameIsIndex,
     #[display("mismatched tag: opened <{opened}>, closed <\\{closed}>")]
     MismatchedTag { opened: String, closed: String },
     #[display("unterminated string")]
@@ -118,13 +130,13 @@ pub enum TextParseErrorKind {
 }
 
 /// Convert a lex error to the corresponding [`TextParseErrorKind`].
-pub fn lex_error_to_parse_error(e: LexError) -> (usize, TextParseErrorKind) {
+pub fn lex_error_to_parse_error(e: LexError) -> (Span, TextParseErrorKind) {
     let kind = match e.kind {
         LexErrorKind::UnterminatedString => TextParseErrorKind::UnterminatedString,
         LexErrorKind::UnterminatedBlockComment => TextParseErrorKind::UnterminatedBlockComment,
         LexErrorKind::UnexpectedChar(c) => TextParseErrorKind::UnexpectedChar(c),
     };
-    (e.span.start, kind)
+    (e.span, kind)
 }
 
 /// A short human name for a token kind, for "expected …, found …" messages.
@@ -218,11 +230,19 @@ impl<'a> Cursor<'a> {
         self.tokens[self.pos.saturating_sub(1)].span.end
     }
 
-    pub fn err(&self, kind: TextParseErrorKind) -> ParseError<TextParseErrorKind> {
-        ParseError::new(self.peek().span.start, kind)
+    /// The span of the token just consumed — used to anchor a [`ParseContext`]
+    /// on the keyword that opened the construct.
+    pub fn prev_span(&self) -> Span {
+        self.tokens[self.pos.saturating_sub(1)].span
     }
 
-    pub fn err_at(&self, at: usize, kind: TextParseErrorKind) -> ParseError<TextParseErrorKind> {
+    /// An error about the token the cursor is sitting on. The error span is the
+    /// whole token, so the caret underlines it.
+    pub fn err(&self, kind: TextParseErrorKind) -> ParseError<TextParseErrorKind> {
+        ParseError::new(self.peek().span, kind)
+    }
+
+    pub fn err_at(&self, at: Span, kind: TextParseErrorKind) -> ParseError<TextParseErrorKind> {
         ParseError::new(at, kind)
     }
 
@@ -230,23 +250,33 @@ impl<'a> Cursor<'a> {
         if self.at(kind) {
             Ok(self.bump())
         } else {
-            let found = self.peek();
-            Err(self.err(TextParseErrorKind::UnexpectedToken {
-                expected: format!("{}, found {}", describe(kind), describe(found.kind)),
-            }))
+            Err(self.unexpected(describe(kind)))
         }
     }
 
-    pub fn expect_ident(&mut self, what: &str) -> Result<String, ParseError<TextParseErrorKind>> {
+    pub fn expect_ident(
+        &mut self,
+        what: &'static str,
+    ) -> Result<String, ParseError<TextParseErrorKind>> {
         let t = self.peek();
         if t.kind == TokenKind::Ident {
             self.bump();
             Ok(t.source.to_string())
         } else {
-            Err(self.err(TextParseErrorKind::UnexpectedToken {
-                expected: format!("{what}, found {}", describe(t.kind)),
-            }))
+            Err(self.unexpected(what))
         }
+    }
+
+    /// An `UnexpectedToken` about the current token, describing what the
+    /// grammar wanted. The "found …" half is added by the `Display` impl.
+    pub fn unexpected(
+        &self,
+        expected: impl Into<Cow<'static, str>>,
+    ) -> ParseError<TextParseErrorKind> {
+        self.err(TextParseErrorKind::UnexpectedToken {
+            expected: expected.into(),
+            found: self.peek().kind,
+        })
     }
 }
 
@@ -329,11 +359,13 @@ impl<'a> Lexer<'a> {
                     self.skip_to_end_of_line();
                     continue;
                 }
+                // Anchor on the `/*` that was never closed, not on the rest of
+                // the file: the opener is the thing the reader has to go fix.
                 return Err(LexError {
                     kind: LexErrorKind::UnterminatedBlockComment,
                     span: Span {
                         start: self.pos,
-                        end: self.input.len(),
+                        end: (self.pos + 2).min(self.input.len()),
                     },
                 });
             }
@@ -421,11 +453,13 @@ impl<'a> Lexer<'a> {
             }
             self.pos += c.len_utf8();
         }
+        // Anchor on the opening quote. The scan ran to EOF, but the byte the
+        // reader has to go fix is where the string started.
         Err(LexError {
             kind: LexErrorKind::UnterminatedString,
             span: Span {
                 start,
-                end: self.input.len(),
+                end: (start + 1).min(self.input.len()),
             },
         })
     }

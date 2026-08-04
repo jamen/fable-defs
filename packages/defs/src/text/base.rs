@@ -59,25 +59,64 @@ impl LineIndex {
     }
 }
 
+/// The construct a parse error happened *inside*, rendered as the diagnostic's
+/// secondary label ("in enum `ESoundNames`").
+///
+/// One context, not a stack: the innermost production to see the error wins,
+/// because it is the first to run on the way out. That is the frame a reader
+/// needs — the enclosing enum, definition, or tagged block — and the file name
+/// supplies the rest.
+#[derive(Clone, Debug)]
+pub struct ParseContext {
+    /// What kind of construct: "definition", "enum", "namespace", "#ifdef",
+    /// "tagged block".
+    pub what: &'static str,
+    /// Its name, when it has one (`UI_TABLE`, `ESoundNames`).
+    pub name: Option<String>,
+    /// The name if present, else the opening keyword — never the whole header
+    /// line, so the label underlines what identifies the construct.
+    pub span: Span,
+}
+
+impl ParseContext {
+    pub fn new(what: &'static str, name: Option<String>, span: Span) -> Self {
+        Self { what, name, span }
+    }
+
+    /// The secondary-label text: "in enum `ESoundNames`" / "in this enum".
+    pub fn label(&self) -> String {
+        match &self.name {
+            Some(name) => format!("in {} `{name}`", self.what),
+            None => format!("in this {}", self.what),
+        }
+    }
+}
+
 #[derive(Debug, Display, Error)]
 #[display("{inner}")]
 pub struct ParseError<InnerError> {
-    pub pos: usize,
-    pub def_header_pos: Option<usize>,
+    /// The source range the error is *about* — normally the offending token, so
+    /// the rendered caret covers it rather than pointing at a single byte.
+    pub span: Span,
+    pub context: Option<ParseContext>,
     pub inner: InnerError,
 }
 
 impl<T> ParseError<T> {
-    pub(crate) fn new(pos: usize, inner: T) -> Self {
+    pub(crate) fn new(span: Span, inner: T) -> Self {
         Self {
-            pos,
-            def_header_pos: None,
+            span,
+            context: None,
             inner,
         }
     }
 
-    pub(crate) fn with_def_header(mut self, def_header_pos: usize) -> Self {
-        self.def_header_pos = Some(def_header_pos);
+    /// Attach the enclosing construct. Innermost wins: an outer production
+    /// never overwrites context an inner one already set.
+    pub(crate) fn within(mut self, context: &ParseContext) -> Self {
+        if self.context.is_none() {
+            self.context = Some(context.clone());
+        }
         self
     }
 }

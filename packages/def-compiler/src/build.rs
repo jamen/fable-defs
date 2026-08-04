@@ -608,7 +608,17 @@ fn collect_h_files(dir: &Path, root: &Path, selected_set: Option<&str>, out: &mu
 /// contributes no symbols (or, for an evaluate failure, only those before the
 /// failure), so letting the build continue turns one broken header into a
 /// distant pile of "unknown symbol" errors at the use sites.
-fn load_symbols(source: &Path, diagnostics: &Diagnostics) -> SymbolTable {
+///
+/// Every header read is registered in `sources`, so its diagnostics render with
+/// a line number, a source excerpt, and a caret — the same treatment `.def`
+/// files get. Headers are ~3.8 MB against the ~9.1 MB of `.def`/`.tpl` text
+/// already retained; keeping them all (rather than only the failing ones) is
+/// what lets redefinition warnings point at a location too.
+fn load_symbols(
+    source: &Path,
+    diagnostics: &Diagnostics,
+    sources: &mut Vec<SourceFile>,
+) -> SymbolTable {
     let mut symbols = SymbolTable::new();
     let selected_set = select_header_set(source, diagnostics);
     let mut h_files = Vec::new();
@@ -616,28 +626,32 @@ fn load_symbols(source: &Path, diagnostics: &Diagnostics) -> SymbolTable {
     h_files.sort();
     for path in &h_files {
         let display = normalize_path(path);
-        match std::fs::read_to_string(path) {
-            Ok(t) => match parse_header_file(&t) {
-                Ok(hd) => match symbols.evaluate(&hd) {
-                    Ok(redefined) => report_redefinitions(&display, &redefined, diagnostics),
-                    Err(e) => diagnostics.push(BuildDiagnostic::bare(
-                        Severity::Error,
-                        format!("header {display}: evaluate error: {e:?}"),
-                    )),
-                },
-                Err(e) => {
-                    diagnostics.push(BuildDiagnostic::bare(
-                        Severity::Error,
-                        format!("header {display}: parse error: {e}"),
-                    ));
-                }
-            },
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
             Err(e) => {
+                // No text to point at, so this one stays location-less.
                 diagnostics.push(BuildDiagnostic::bare(
                     Severity::Error,
-                    format!("header {display}: read error: {e}"),
+                    format!("cannot read header {display}: {e}"),
                 ));
+                continue;
             }
+        };
+        let sid = sources.len();
+        sources.push(SourceFile {
+            path: display.clone(),
+            text,
+        });
+        let text = &sources[sid].text;
+        match parse_header_file(text) {
+            Ok(hd) => match symbols.evaluate(&hd) {
+                Ok(redefined) => report_redefinitions(&display, &redefined, diagnostics),
+                Err(e) => diagnostics.push(BuildDiagnostic::bare(
+                    Severity::Error,
+                    format!("header {display}: evaluate error: {e:?}"),
+                )),
+            },
+            Err(e) => diagnostics.push(parse_error_diagnostic(sid, &e)),
         }
     }
     symbols
@@ -703,10 +717,12 @@ fn parse_corpus(
     diagnostics: &Diagnostics,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<ParsedCorpus, String> {
-    let mut symbols = load_symbols(source, diagnostics);
+    // Headers are registered first, so header diagnostics can reference them by
+    // source id; `.def`/`.tpl` files append after.
+    let mut sources: Vec<SourceFile> = Vec::new();
+    let mut symbols = load_symbols(source, diagnostics, &mut sources);
     inject_engine_enums(&mut symbols);
 
-    let mut sources: Vec<SourceFile> = Vec::new();
     let mut def_to_source: HashMap<String, usize> = HashMap::new();
     let mut def_spans: HashMap<String, Span> = HashMap::new();
     let mut parsed_files: Vec<ParsedFile> = Vec::new();
@@ -744,7 +760,7 @@ fn parse_corpus(
             Err(e) => {
                 let sid = sources.len();
                 sources.push(SourceFile { path, text });
-                diagnostics.push(parse_error_diagnostic(&sources, sid, &e));
+                diagnostics.push(parse_error_diagnostic(sid, &e));
             }
         }
     }
@@ -797,48 +813,32 @@ fn def_header_end(text: &str, start: usize) -> usize {
 }
 
 /// A parse error is strict and fatal for its file, so the whole file's defs
-/// vanish — it must always be surfaced. `MissingEndDefinition` points at the
-/// unclosed definition; anything else gets a caret at the offending byte plus
-/// an "in this definition" note.
-fn parse_error_diagnostic(
-    sources: &[SourceFile],
-    source: usize,
-    error: &DefParseError,
-) -> BuildDiagnostic {
+/// vanish — it must always be surfaced.
+///
+/// The primary label underlines the offending token; the secondary names the
+/// construct the error happened inside ("in enum `ESoundNames`"), which the
+/// parser attaches as it unwinds. Both grammars produce the same shape.
+fn parse_error_diagnostic(source: usize, error: &DefParseError) -> BuildDiagnostic {
     let msg = format!("{error}");
-    let text = &sources[source].text;
-    let mut labels = Vec::new();
-    match (&error.inner, error.def_header_pos) {
-        (TextParseErrorKind::MissingEndDefinition, Some(def_pos)) => {
-            labels.push(DiagnosticLabel {
-                primary: true,
-                span: Span {
-                    start: def_pos,
-                    end: def_header_end(text, def_pos),
-                },
-                message: Some("missing #end_definition for this definition".to_string()),
-            });
-        }
-        (_, def_header) => {
-            labels.push(DiagnosticLabel {
-                primary: true,
-                span: Span {
-                    start: error.pos,
-                    end: error.pos,
-                },
-                message: Some(msg.clone()),
-            });
-            if let Some(def_pos) = def_header {
-                labels.push(DiagnosticLabel {
-                    primary: false,
-                    span: Span {
-                        start: def_pos,
-                        end: def_header_end(text, def_pos),
-                    },
-                    message: Some("in this definition".to_string()),
-                });
+    let mut labels = vec![DiagnosticLabel {
+        primary: true,
+        span: error.span,
+        message: Some(msg.clone()),
+    }];
+    if let Some(context) = &error.context {
+        // For a missing `#end_definition` the useful statement is about the
+        // *construct*, not the token that revealed it.
+        let note = match error.inner {
+            TextParseErrorKind::MissingEndDefinition => {
+                format!("this {} is never closed", context.what)
             }
-        }
+            _ => context.label(),
+        };
+        labels.push(DiagnosticLabel {
+            primary: false,
+            span: context.span,
+            message: Some(note),
+        });
     }
     BuildDiagnostic {
         severity: Severity::Error,
@@ -944,7 +944,7 @@ fn build_nulldefs(
         }
         // A NULLDEF body is `def_default()` with no statements applied, so this
         // can only fail if the type is missing from the schema entirely.
-        let (body, _warnings) = lower_def(dn, None, &[], symbols, def_indices, names)
+        let body = lower_def(dn, None, &[], symbols, def_indices, names)
             .map_err(|e| format!("NULLDEF lowering failed for {dn}: {e}"))?;
         map.insert(dn.to_string(), body);
     }
@@ -1036,7 +1036,7 @@ fn emit_nulldef_and_named(
             }
         };
 
-        let (lowered, _warnings) = match lower_def(
+        let lowered = match lower_def(
             &def_type,
             ctx.nulldefs.get(def_type.as_str()).as_ref().copied(),
             &body,
@@ -1205,7 +1205,7 @@ fn build_subdefs(
         keys.sort();
         for k in keys {
             let (tag, blk) = &blocks[&k];
-            let (lowered, _sub_warnings) = match lower_def(
+            let lowered = match lower_def(
                 tag,
                 ctx.nulldefs.get(tag.as_str()).as_ref().copied(),
                 blk,

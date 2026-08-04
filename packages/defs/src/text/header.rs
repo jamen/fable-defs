@@ -1,4 +1,4 @@
-use super::base::ParseError;
+use super::base::{ParseContext, ParseError};
 use super::lexer::{Cursor, TextParseErrorKind, lex, lex_error_to_parse_error};
 
 // ── Data types (unchanged from the char-parser era) ───────────────────────────
@@ -92,14 +92,31 @@ pub fn parse_item_on_cursor(
 }
 
 fn parse_enum_body(cursor: &mut Cursor<'_>) -> Result<EnumDecl, ParseError<TextParseErrorKind>> {
+    // `enum` was already bumped by the caller; anchor on it so an anonymous
+    // enum still has something to point at.
+    let keyword_span = cursor.prev_span();
+    let name_span = cursor.peek().span;
     let name = if cursor.at(super::lexer::TokenKind::Ident) {
         Some(cursor.expect_ident("enum name")?)
     } else {
         None
     };
-    cursor.expect(super::lexer::TokenKind::LBrace)?;
-    let variants = parse_enum_variants(cursor)?;
-    cursor.expect(super::lexer::TokenKind::RBrace)?;
+    let ctx = ParseContext::new(
+        "enum",
+        name.clone(),
+        if name.is_some() {
+            name_span
+        } else {
+            keyword_span
+        },
+    );
+    cursor
+        .expect(super::lexer::TokenKind::LBrace)
+        .map_err(|e| e.within(&ctx))?;
+    let variants = parse_enum_variants(cursor).map_err(|e| e.within(&ctx))?;
+    cursor
+        .expect(super::lexer::TokenKind::RBrace)
+        .map_err(|e| e.within(&ctx))?;
     if cursor.at(super::lexer::TokenKind::Semi) {
         cursor.bump();
     }
@@ -117,11 +134,31 @@ fn parse_enum_variants(
         if cursor.at(super::lexer::TokenKind::RBrace) {
             break;
         }
-        variants.push(parse_enum_variant(cursor)?);
+        let variant = parse_enum_variant(cursor)?;
+        let has_value = variant.value.is_some();
+        variants.push(variant);
         if cursor.at(super::lexer::TokenKind::Comma) {
             cursor.bump();
-        } else {
+        } else if cursor.at(super::lexer::TokenKind::RBrace) {
             break;
+        } else {
+            // Report here rather than breaking and letting the caller's
+            // `expect(RBrace)` fail, which would claim `}` was the only option.
+            //
+            // The expected set depends on how far the variant got. If it has no
+            // value yet, `parse_enum_variant` peeked for `=` at *this* byte and
+            // did not find it, so `=` is still a legal continuation and must be
+            // listed. Once a value has been read, only a separator can follow.
+            //
+            // This is also what a variant name split by a stray token looks
+            // like — `FOO BAR = 1` parses `FOO`, then lands here on `BAR` —
+            // without the message having to guess at that interpretation.
+            let expected = if has_value {
+                "`,` or `}`"
+            } else {
+                "`=`, `,` or `}`"
+            };
+            return Err(cursor.unexpected(expected));
         }
     }
     Ok(variants)
@@ -180,19 +217,14 @@ fn parse_enum_leaf(cursor: &mut Cursor<'_>) -> Result<EnumExpr, ParseError<TextP
             let n = t
                 .source
                 .parse::<i64>()
-                .map_err(|_| ParseError::new(t.span.start, TextParseErrorKind::InvalidNumber))?;
+                .map_err(|_| ParseError::new(t.span, TextParseErrorKind::InvalidNumber))?;
             Ok(EnumExpr::Int(n))
         }
         TokenKind::Ident => {
             let t = cursor.bump();
             Ok(EnumExpr::Ident(t.source.to_string()))
         }
-        _ => Err(cursor.err(TextParseErrorKind::UnexpectedToken {
-            expected: format!(
-                "number or identifier, found {}",
-                super::lexer::describe(cursor.peek().kind)
-            ),
-        })),
+        _ => Err(cursor.unexpected("number or identifier")),
     }
 }
 
@@ -200,34 +232,40 @@ fn parse_define_body(cursor: &mut Cursor<'_>) -> Result<Define, ParseError<TextP
     let name = cursor.expect_ident("identifier")?;
     let t = cursor.peek();
     if t.kind != super::lexer::TokenKind::Number {
-        return Err(cursor.err(TextParseErrorKind::UnexpectedToken {
-            expected: format!("number, found {}", super::lexer::describe(t.kind)),
-        }));
+        return Err(cursor.unexpected("number"));
     }
     cursor.bump();
     let value = t
         .source
         .parse::<i64>()
-        .map_err(|_| ParseError::new(t.span.start, TextParseErrorKind::InvalidNumber))?;
+        .map_err(|_| ParseError::new(t.span, TextParseErrorKind::InvalidNumber))?;
     Ok(Define { name, value })
 }
 
 fn parse_namespace_body(
     cursor: &mut Cursor<'_>,
 ) -> Result<Namespace, ParseError<TextParseErrorKind>> {
+    let name_span = cursor.peek().span;
     let name = cursor.expect_ident("identifier")?;
-    cursor.expect(super::lexer::TokenKind::LBrace)?;
+    let ctx = ParseContext::new("namespace", Some(name.clone()), name_span);
+    cursor
+        .expect(super::lexer::TokenKind::LBrace)
+        .map_err(|e| e.within(&ctx))?;
     let mut items = Vec::new();
     loop {
         if cursor.at(super::lexer::TokenKind::Eof) {
-            return Err(cursor.err(TextParseErrorKind::UnterminatedNamespace));
+            return Err(cursor
+                .err(TextParseErrorKind::UnterminatedNamespace)
+                .within(&ctx));
         }
         if cursor.at(super::lexer::TokenKind::RBrace) {
             break;
         }
-        items.push(parse_item_on_cursor(cursor)?);
+        items.push(parse_item_on_cursor(cursor).map_err(|e| e.within(&ctx))?);
     }
-    cursor.expect(super::lexer::TokenKind::RBrace)?;
+    cursor
+        .expect(super::lexer::TokenKind::RBrace)
+        .map_err(|e| e.within(&ctx))?;
     if cursor.at(super::lexer::TokenKind::Semi) {
         cursor.bump();
     }
@@ -238,34 +276,43 @@ fn parse_if_def_body(
     cursor: &mut Cursor<'_>,
     inverted: bool,
 ) -> Result<IfDef, ParseError<TextParseErrorKind>> {
+    let directive = if inverted { "#ifndef" } else { "#ifdef" };
+    let cond_span = cursor.peek().span;
     let condition = cursor.expect_ident("identifier")?;
+    let ctx = ParseContext::new(directive, Some(condition.clone()), cond_span);
     let mut if_branch = Vec::new();
     loop {
         if cursor.at(super::lexer::TokenKind::Eof) {
-            return Err(cursor.err(TextParseErrorKind::UnterminatedIfDef));
+            return Err(cursor
+                .err(TextParseErrorKind::UnterminatedIfDef)
+                .within(&ctx));
         }
         if cursor.at(super::lexer::TokenKind::Else) || cursor.at(super::lexer::TokenKind::Endif) {
             break;
         }
-        if_branch.push(parse_item_on_cursor(cursor)?);
+        if_branch.push(parse_item_on_cursor(cursor).map_err(|e| e.within(&ctx))?);
     }
     let else_branch = if cursor.at(super::lexer::TokenKind::Else) {
         cursor.bump();
         let mut else_branch = Vec::new();
         loop {
             if cursor.at(super::lexer::TokenKind::Eof) {
-                return Err(cursor.err(TextParseErrorKind::UnterminatedIfDef));
+                return Err(cursor
+                    .err(TextParseErrorKind::UnterminatedIfDef)
+                    .within(&ctx));
             }
             if cursor.at(super::lexer::TokenKind::Endif) {
                 break;
             }
-            else_branch.push(parse_item_on_cursor(cursor)?);
+            else_branch.push(parse_item_on_cursor(cursor).map_err(|e| e.within(&ctx))?);
         }
         Some(else_branch)
     } else {
         None
     };
-    cursor.expect(super::lexer::TokenKind::Endif)?;
+    cursor
+        .expect(super::lexer::TokenKind::Endif)
+        .map_err(|e| e.within(&ctx))?;
     Ok(IfDef {
         condition,
         if_branch,
@@ -283,8 +330,8 @@ pub struct HeaderParser<'a> {
 impl<'a> HeaderParser<'a> {
     pub fn new(input: &'a str) -> Result<Self, HeaderParseError> {
         let tokens = lex(input).map_err(|e| {
-            let (pos, kind) = lex_error_to_parse_error(e);
-            ParseError::new(pos, kind)
+            let (span, kind) = lex_error_to_parse_error(e);
+            ParseError::new(span, kind)
         })?;
         Ok(Self {
             cursor: Cursor::new(tokens),

@@ -268,10 +268,10 @@ pub fn lower_controls(
     symbols: &SymbolTable,
     def_indices: &HashMap<String, u32>,
     names: &RefCell<NamesBuilder>,
-) -> Result<(DefBody, Vec<Spanned<Statement>>), LowerError> {
+) -> Result<DefBody, LowerError> {
     let base = base_or_default!(base_opt, Controls, ControlsDef);
     let generic_body = filter_out_field(body, "Controls");
-    let (mut out, mut warnings) = lower_generic(&base, &generic_body, symbols, def_indices, names)?;
+    let mut out = lower_generic(&base, &generic_body, symbols, def_indices, names)?;
 
     let mut r = DefReader::new(body, symbols);
     for add in r.calls("Controls", "Add") {
@@ -279,8 +279,7 @@ pub fn lower_controls(
         out.controls.push(lower_action_input_control(&ctor)?);
     }
 
-    warnings.extend(r.remaining_statements());
-    Ok((DefBody::Controls(out), warnings))
+    Ok(DefBody::Controls(out))
 }
 
 const CONTROLLER_XBOX_PAD: i32 = 1;
@@ -328,10 +327,10 @@ pub fn lower_front_end(
     symbols: &SymbolTable,
     def_indices: &HashMap<String, u32>,
     names: &RefCell<NamesBuilder>,
-) -> Result<(DefBody, Vec<Spanned<Statement>>), LowerError> {
+) -> Result<DefBody, LowerError> {
     let base = base_or_default!(base_opt, FrontEnd, FrontEndDef);
     let generic_body = filter_out_field(body, "vAttractModeMovie");
-    let (mut out, mut warnings) = lower_generic(&base, &generic_body, symbols, def_indices, names)?;
+    let mut out = lower_generic(&base, &generic_body, symbols, def_indices, names)?;
 
     let mut r = DefReader::new(body, symbols);
     for add in r.calls("vAttractModeMovie", "Add") {
@@ -346,8 +345,7 @@ pub fn lower_front_end(
         out.v_attract_mode_movie[idx] = value;
     }
 
-    warnings.extend(r.remaining_statements());
-    Ok((DefBody::FrontEnd(out), warnings))
+    Ok(DefBody::FrontEnd(out))
 }
 
 // ── UI_MISC_THINGS_DEF ───────────────────────────────────────────────────────
@@ -364,11 +362,11 @@ pub fn lower_ui_misc_things(
     symbols: &SymbolTable,
     def_indices: &HashMap<String, u32>,
     names: &RefCell<NamesBuilder>,
-) -> Result<(DefBody, Vec<Spanned<Statement>>), LowerError> {
+) -> Result<DefBody, LowerError> {
     let base = base_or_default!(base_opt, UiMiscThings, UiMiscThingsDef);
     // Delegate all scalar fields to generic lowering.
     let generic_body = filter_out_fields(body, &["MiniMapGraphics", "MapPaths"]);
-    let (mut out, mut warnings) = lower_generic(&base, &generic_body, symbols, def_indices, names)?;
+    let mut out = lower_generic(&base, &generic_body, symbols, def_indices, names)?;
 
     // Bespoke: MiniMapGraphics and MapPaths need last-wins-by-key merge semantics
     // rather than the generic append, + MapPaths sorts by key afterward.
@@ -399,8 +397,7 @@ pub fn lower_ui_misc_things(
     }
     out.map_paths.sort_by_key(|e| e.id);
 
-    warnings.extend(r.remaining_statements());
-    Ok((DefBody::UiMiscThings(out), warnings))
+    Ok(DefBody::UiMiscThings(out))
 }
 
 // ── UI ───────────────────────────────────────────────────────────────────────
@@ -484,7 +481,7 @@ pub fn lower_ui(
     symbols: &SymbolTable,
     def_indices: &HashMap<String, u32>,
     names: &RefCell<NamesBuilder>,
-) -> Result<(DefBody, Vec<Spanned<Statement>>), LowerError> {
+) -> Result<DefBody, LowerError> {
     let base = base_or_default!(base_opt, Ui, UiDef);
     // Seed defaults that differ from NULLDEF_UI before text processing.
     let base_seeded = {
@@ -518,8 +515,7 @@ pub fn lower_ui(
         "Font",
     ];
     let generic_body = filter_out_fields(body, bespoke_names);
-    let (mut out, mut warnings) =
-        lower_generic(&base_seeded, &generic_body, symbols, def_indices, names)?;
+    let mut out = lower_generic(&base_seeded, &generic_body, symbols, def_indices, names)?;
 
     // Bespoke fields — read from the full body with a fresh reader.
     let mut r = DefReader::new(body, symbols);
@@ -655,8 +651,7 @@ pub fn lower_ui(
         );
     }
 
-    warnings.extend(r.remaining_statements());
-    Ok((DefBody::Ui(out), warnings))
+    Ok(DefBody::Ui(out))
 }
 
 fn apply_ui_state(
@@ -741,15 +736,13 @@ fn apply_ui_state(
 
 /// Lower a `#[derive(DefStruct)]` type generically: `base` supplies defaults (the
 /// type's NULLDEF), and text statements override individual fields.
-/// Returns the lowered value and any unconsumed statements (misspelled field
-/// names, cross-type specialization leftovers) so the caller can emit warnings.
 pub fn lower_generic<T: VisitFields + Clone>(
     base: &T,
     body: &[Spanned<Statement>],
     symbols: &SymbolTable,
     def_indices: &HashMap<String, u32>,
     names: &RefCell<NamesBuilder>,
-) -> Result<(T, Vec<Spanned<Statement>>), LowerError> {
+) -> Result<T, LowerError> {
     let mut out = (*base).clone();
     let stripped = strip_superseded_by_clear(body);
     let mut reader = DefReader::new(&stripped, symbols);
@@ -765,8 +758,7 @@ pub fn lower_generic<T: VisitFields + Clone>(
             return Err(error);
         }
     }
-    let remaining = reader.remaining_statements();
-    Ok((out, remaining))
+    Ok(out)
 }
 
 /// `Field.clear()` has statement-order semantics: it discards everything added
@@ -2224,10 +2216,9 @@ fn build_thing_components(
 macro_rules! lower_thing {
     ($base:expr, $body:expr, $symbols:expr, $def_indices:expr, $names:expr, $Variant:ident) => {{
         let base = base_or_default!($base, $Variant);
-        let (mut lowered, warnings) =
-            lower_generic::<$Variant>(&base, $body, $symbols, $def_indices, $names)?;
+        let mut lowered = lower_generic::<$Variant>(&base, $body, $symbols, $def_indices, $names)?;
         lowered.components = build_thing_components($body, $names);
-        (DefBody::$Variant(lowered), warnings)
+        DefBody::$Variant(lowered)
     }};
 }
 
@@ -2241,11 +2232,11 @@ fn lower_animating_object_def(
     symbols: &SymbolTable,
     def_indices: &HashMap<String, u32>,
     names: &RefCell<NamesBuilder>,
-) -> Result<(DefBody, Vec<Spanned<Statement>>), LowerError> {
+) -> Result<DefBody, LowerError> {
     let base = base_or_default!(base_opt, AnimatingObjectDef);
     let (anims, filtered, defaults) =
         build_animation_anims(base.animation.anims.clone(), body, symbols, names);
-    let (mut lowered, warnings) =
+    let mut lowered =
         lower_generic::<AnimatingObjectDef>(&base, &filtered, symbols, def_indices, names)?;
     lowered.animation.anims = anims;
     if let Some(d) = defaults.delay {
@@ -2254,7 +2245,7 @@ fn lower_animating_object_def(
     if let Some(g) = defaults.group {
         lowered.animation.default_group = g;
     }
-    Ok((DefBody::AnimatingObjectDef(lowered), warnings))
+    Ok(DefBody::AnimatingObjectDef(lowered))
 }
 
 fn lower_appearance_def(
@@ -2263,11 +2254,11 @@ fn lower_appearance_def(
     symbols: &SymbolTable,
     def_indices: &HashMap<String, u32>,
     names: &RefCell<NamesBuilder>,
-) -> Result<(DefBody, Vec<Spanned<Statement>>), LowerError> {
+) -> Result<DefBody, LowerError> {
     let base = base_or_default!(base_opt, AppearanceDef);
     let (anims, filtered, defaults) =
         build_animation_anims(base.animation.anims.clone(), body, symbols, names);
-    let (mut lowered, warnings) =
+    let mut lowered =
         lower_generic::<AppearanceDef>(&base, &filtered, symbols, def_indices, names)?;
     lowered.animation.anims = anims;
     if let Some(d) = defaults.delay {
@@ -2276,7 +2267,7 @@ fn lower_appearance_def(
     if let Some(g) = defaults.group {
         lowered.animation.default_group = g;
     }
-    Ok((DefBody::AppearanceDef(lowered), warnings))
+    Ok(DefBody::AppearanceDef(lowered))
 }
 
 fn lower_camera_manager_def(
@@ -2285,7 +2276,7 @@ fn lower_camera_manager_def(
     symbols: &SymbolTable,
     def_indices: &HashMap<String, u32>,
     names: &RefCell<NamesBuilder>,
-) -> Result<(DefBody, Vec<Spanned<Statement>>), LowerError> {
+) -> Result<DefBody, LowerError> {
     let base = base_or_default!(base_opt, CameraManagerDef);
     // CameraList.clear() is a method call the generic lowering handles as a
     // container wipe; the game compiler treats it as a no-op. Strip only that
@@ -2303,8 +2294,8 @@ fn lower_camera_manager_def(
         })
         .cloned()
         .collect();
-    let (lowered, warnings) = lower_generic(&base, &filtered, symbols, def_indices, names)?;
-    Ok((DefBody::CameraManagerDef(lowered), warnings))
+    let lowered = lower_generic(&base, &filtered, symbols, def_indices, names)?;
+    Ok(DefBody::CameraManagerDef(lowered))
 }
 
 fn lower_combat_ability_block_def(
@@ -2313,13 +2304,13 @@ fn lower_combat_ability_block_def(
     symbols: &SymbolTable,
     def_indices: &HashMap<String, u32>,
     names: &RefCell<NamesBuilder>,
-) -> Result<(DefBody, Vec<Spanned<Statement>>), LowerError> {
+) -> Result<DefBody, LowerError> {
     let base = base_or_default!(base_opt, CombatAbilityBlockDefBase);
-    let (mut lowered, warnings) =
+    let mut lowered =
         lower_generic::<CombatAbilityBlockDefBase>(&base, body, symbols, def_indices, names)?;
     lowered.valid_block_weapon_types.sort();
     lowered.valid_block_weapon_types.dedup();
-    Ok((DefBody::CombatAbilityBlockDefBase(lowered), warnings))
+    Ok(DefBody::CombatAbilityBlockDefBase(lowered))
 }
 
 fn lower_will_response_def(
@@ -2328,16 +2319,16 @@ fn lower_will_response_def(
     symbols: &SymbolTable,
     def_indices: &HashMap<String, u32>,
     names: &RefCell<NamesBuilder>,
-) -> Result<(DefBody, Vec<Spanned<Statement>>), LowerError> {
+) -> Result<DefBody, LowerError> {
     let base = base_or_default!(base_opt, WillResponseDef);
-    let (lowered, warnings) = lower_generic(
+    let lowered = lower_generic(
         &base,
         &filter_out_field(body, "ForceLightningable"),
         symbols,
         def_indices,
         names,
     )?;
-    Ok((DefBody::WillResponseDef(lowered), warnings))
+    Ok(DefBody::WillResponseDef(lowered))
 }
 
 fn lower_hero_experience_def(
@@ -2346,12 +2337,11 @@ fn lower_hero_experience_def(
     symbols: &SymbolTable,
     def_indices: &HashMap<String, u32>,
     names: &RefCell<NamesBuilder>,
-) -> Result<(DefBody, Vec<Spanned<Statement>>), LowerError> {
+) -> Result<DefBody, LowerError> {
     let base = base_or_default!(base_opt, HeroExperienceDef);
-    let (mut lowered, warnings) =
-        lower_generic::<HeroExperienceDef>(&base, body, symbols, def_indices, names)?;
+    let mut lowered = lower_generic::<HeroExperienceDef>(&base, body, symbols, def_indices, names)?;
     lowered.stat_increase_per_hit_type2 = lowered.stat_increase_per_hit_type.clone();
-    Ok((DefBody::HeroExperienceDef(lowered), warnings))
+    Ok(DefBody::HeroExperienceDef(lowered))
 }
 
 fn lower_script_def(
@@ -2360,12 +2350,11 @@ fn lower_script_def(
     symbols: &SymbolTable,
     def_indices: &HashMap<String, u32>,
     names: &RefCell<NamesBuilder>,
-) -> Result<(DefBody, Vec<Spanned<Statement>>), LowerError> {
+) -> Result<DefBody, LowerError> {
     let base = base_or_default!(base_opt, ScriptDef);
-    let (mut lowered, warnings) =
-        lower_generic::<ScriptDef>(&base, body, symbols, def_indices, names)?;
+    let mut lowered = lower_generic::<ScriptDef>(&base, body, symbols, def_indices, names)?;
     lowered.temple_prayer_factor_highest = lowered.temple_prayer_factor_highest2;
-    Ok((DefBody::ScriptDef(lowered), warnings))
+    Ok(DefBody::ScriptDef(lowered))
 }
 
 fn lower_creature_def(
@@ -2374,7 +2363,7 @@ fn lower_creature_def(
     symbols: &SymbolTable,
     def_indices: &HashMap<String, u32>,
     names: &RefCell<NamesBuilder>,
-) -> Result<(DefBody, Vec<Spanned<Statement>>), LowerError> {
+) -> Result<DefBody, LowerError> {
     let base = base_or_default!(base_opt, CreatureDef);
     let (ram, filtered) =
         build_random_appearance_morph(base.random_appearance_morph.clone(), body, symbols);
@@ -2479,12 +2468,11 @@ fn lower_creature_def(
         filtered2.push(stmt.clone());
     }
     exprs.sort_by_key(|e| e.type_);
-    let (mut lowered, warnings) =
-        lower_generic::<CreatureDef>(&base, &filtered2, symbols, def_indices, names)?;
+    let mut lowered = lower_generic::<CreatureDef>(&base, &filtered2, symbols, def_indices, names)?;
     lowered.random_appearance_morph = ram;
     lowered.expressions.expressions = exprs;
     lowered.wound_morphs.morphs = wounds;
-    Ok((DefBody::CreatureDef(lowered), warnings))
+    Ok(DefBody::CreatureDef(lowered))
 }
 
 fn lower_hero_morph_def(
@@ -2493,7 +2481,7 @@ fn lower_hero_morph_def(
     symbols: &SymbolTable,
     def_indices: &HashMap<String, u32>,
     names: &RefCell<NamesBuilder>,
-) -> Result<(DefBody, Vec<Spanned<Statement>>), LowerError> {
+) -> Result<DefBody, LowerError> {
     let base = base_or_default!(base_opt, HeroMorphDef);
     // `TextureMorphs.Add(count, morph_type, replacing_tex, bank_index, blend)`
     // and `ParticleMorphs.Add(morph_type, particle_idx, start_val, end_val,
@@ -2595,12 +2583,11 @@ fn lower_hero_morph_def(
         }
         filtered.push(stmt.clone());
     }
-    let (mut lowered, warnings) =
-        lower_generic::<HeroMorphDef>(&base, &filtered, symbols, def_indices, names)?;
+    let mut lowered = lower_generic::<HeroMorphDef>(&base, &filtered, symbols, def_indices, names)?;
     lowered.texture_morphs.morphs = tex_morphs;
     lowered.particle_morphs.morphs = part_morphs;
     lowered.idle_particle_morphs.morphs = idle_part_morphs;
-    Ok((DefBody::HeroMorphDef(lowered), warnings))
+    Ok(DefBody::HeroMorphDef(lowered))
 }
 
 fn lower_opinion_reaction_manager_def(
@@ -2609,7 +2596,7 @@ fn lower_opinion_reaction_manager_def(
     symbols: &SymbolTable,
     def_indices: &HashMap<String, u32>,
     names: &RefCell<NamesBuilder>,
-) -> Result<(DefBody, Vec<Spanned<Statement>>), LowerError> {
+) -> Result<DefBody, LowerError> {
     let base = base_or_default!(base_opt, OpinionReactionManagerDef);
     let eval = Evaluator::new(symbols);
     const CONSTANT_FPS: f32 = 30.0;
@@ -2771,7 +2758,7 @@ fn lower_opinion_reaction_manager_def(
         filtered_body.push(stmt.clone());
     }
 
-    let (mut lowered, warnings) = lower_generic::<OpinionReactionManagerDef>(
+    let mut lowered = lower_generic::<OpinionReactionManagerDef>(
         &base,
         &filtered_body,
         symbols,
@@ -2816,7 +2803,7 @@ fn lower_opinion_reaction_manager_def(
     lowered.frequency = ReactionFrequencyTraitsArray {
         traits: freq_traits,
     };
-    Ok((DefBody::OpinionReactionManagerDef(lowered), warnings))
+    Ok(DefBody::OpinionReactionManagerDef(lowered))
 }
 
 fn lower_entity_sound_def(
@@ -2825,7 +2812,7 @@ fn lower_entity_sound_def(
     symbols: &SymbolTable,
     def_indices: &HashMap<String, u32>,
     names: &RefCell<NamesBuilder>,
-) -> Result<(DefBody, Vec<Spanned<Statement>>), LowerError> {
+) -> Result<DefBody, LowerError> {
     let base = base_or_default!(base_opt, EntitySoundDef);
     let mut f0 = base.sound_map.f0.clone();
     let mut f1 = base.sound_map.f1.clone();
@@ -2875,11 +2862,10 @@ fn lower_entity_sound_def(
     }
     f0.sort_by_key(|e| e.key);
     f1.sort_by_key(|e| e.key);
-    let (mut lowered, warnings) =
-        lower_generic::<EntitySoundDef>(&base, &rest, symbols, def_indices, names)?;
+    let mut lowered = lower_generic::<EntitySoundDef>(&base, &rest, symbols, def_indices, names)?;
     lowered.sound_map.f0 = f0;
     lowered.sound_map.f1 = f1;
-    Ok((DefBody::EntitySoundDef(lowered), warnings))
+    Ok(DefBody::EntitySoundDef(lowered))
 }
 
 fn lower_flammable_def(
@@ -2888,7 +2874,7 @@ fn lower_flammable_def(
     symbols: &SymbolTable,
     def_indices: &HashMap<String, u32>,
     names: &RefCell<NamesBuilder>,
-) -> Result<(DefBody, Vec<Spanned<Statement>>), LowerError> {
+) -> Result<DefBody, LowerError> {
     let base = base_or_default!(base_opt, FlammableDef);
     let mut entries = base.effect_creation_set.containment_map.0.clone();
     let eval = Evaluator::new(symbols);
@@ -2908,10 +2894,9 @@ fn lower_flammable_def(
         entries.push((DefString(off), value));
     }
     entries.sort_by_key(|(k, _)| k.0);
-    let (mut lowered, warnings) =
-        lower_generic::<FlammableDef>(&base, &rest, symbols, def_indices, names)?;
+    let mut lowered = lower_generic::<FlammableDef>(&base, &rest, symbols, def_indices, names)?;
     lowered.effect_creation_set.containment_map = VecMap(entries);
-    Ok((DefBody::FlammableDef(lowered), warnings))
+    Ok(DefBody::FlammableDef(lowered))
 }
 
 fn lower_opinion_deed_effects_def(
@@ -2920,7 +2905,7 @@ fn lower_opinion_deed_effects_def(
     symbols: &SymbolTable,
     def_indices: &HashMap<String, u32>,
     names: &RefCell<NamesBuilder>,
-) -> Result<(DefBody, Vec<Spanned<Statement>>), LowerError> {
+) -> Result<DefBody, LowerError> {
     let base = base_or_default!(base_opt, OpinionDeedEffectsDef);
     // `Effects.Add(opinion, peak, run_in_secs, run_out_secs, persist)` is
     // NOT stored verbatim: the C++ ctor (`COpinionTransientOffset`,
@@ -2962,10 +2947,10 @@ fn lower_opinion_deed_effects_def(
         }
         filtered_body.push(stmt.clone());
     }
-    let (mut lowered, warnings) =
+    let mut lowered =
         lower_generic::<OpinionDeedEffectsDef>(&base, &filtered_body, symbols, def_indices, names)?;
     lowered.effects = OpinionTransientOffsetList { f0: effects };
-    Ok((DefBody::OpinionDeedEffectsDef(lowered), warnings))
+    Ok(DefBody::OpinionDeedEffectsDef(lowered))
 }
 
 fn lower_opinion_personality_def(
@@ -2974,7 +2959,7 @@ fn lower_opinion_personality_def(
     symbols: &SymbolTable,
     def_indices: &HashMap<String, u32>,
     names: &RefCell<NamesBuilder>,
-) -> Result<(DefBody, Vec<Spanned<Statement>>), LowerError> {
+) -> Result<DefBody, LowerError> {
     let base = base_or_default!(base_opt, OpinionPersonalityDef);
     // PersonalityTraits.Set(index, 9 floats) — 5 opinion entries × 36
     // bytes each = 180 bytes.  Extract these calls from the body before
@@ -3021,10 +3006,10 @@ fn lower_opinion_personality_def(
         }
         filtered_body.push(stmt.clone());
     }
-    let (mut lowered, warnings) =
+    let mut lowered =
         lower_generic::<OpinionPersonalityDef>(&base, &filtered_body, symbols, def_indices, names)?;
     lowered.personality_traits = OpinionPersonalityTraitsPtr { f0: traits_blob };
-    Ok((DefBody::OpinionPersonalityDef(lowered), warnings))
+    Ok(DefBody::OpinionPersonalityDef(lowered))
 }
 
 fn lower_opinion_source_def(
@@ -3033,14 +3018,14 @@ fn lower_opinion_source_def(
     symbols: &SymbolTable,
     def_indices: &HashMap<String, u32>,
     names: &RefCell<NamesBuilder>,
-) -> Result<(DefBody, Vec<Spanned<Statement>>), LowerError> {
+) -> Result<DefBody, LowerError> {
     let base = base_or_default!(base_opt, OpinionSourceDef);
-    let (mut lowered, warnings) = lower_generic(&base, body, symbols, def_indices, names)?;
+    let mut lowered = lower_generic(&base, body, symbols, def_indices, names)?;
     // The 79 BinaryReaction bools are derived from ReactionFlagDefault
     // + the ReactionFlag map, not read as controls.
     lowered.derive_binary_reactions();
     lowered.derive_binary_opinions();
-    Ok((DefBody::OpinionSourceDef(lowered), warnings))
+    Ok(DefBody::OpinionSourceDef(lowered))
 }
 
 fn lower_player_gui_def(
@@ -3049,14 +3034,13 @@ fn lower_player_gui_def(
     symbols: &SymbolTable,
     def_indices: &HashMap<String, u32>,
     names: &RefCell<NamesBuilder>,
-) -> Result<(DefBody, Vec<Spanned<Statement>>), LowerError> {
+) -> Result<DefBody, LowerError> {
     // The Highlight* Vec fields are pre-sized with `.resize(N)` and then
     // filled by indexed constructors/scalars
     // (`HighlightStartColour[CURSOR_TYPE_USABLE] CRGBColour(...)`), all
     // handled by the generic vec/constructor-in-group lowering.
     let base = base_or_default!(base_opt, PlayerGuiDef);
-    let (mut lowered, warnings) =
-        lower_generic::<PlayerGuiDef>(&base, body, symbols, def_indices, names)?;
+    let mut lowered = lower_generic::<PlayerGuiDef>(&base, body, symbols, def_indices, names)?;
     // VecMap<String, i32> fields must be sorted by CRC32 of the key to
     // match C++ std::map<CCharString, long> ordering.
     let sort_by_crc32 = |v: &mut VecMap<String, i32>| {
@@ -3065,7 +3049,7 @@ fn lower_player_gui_def(
     sort_by_crc32(&mut lowered.script_sprites);
     sort_by_crc32(&mut lowered.game_action_values);
     sort_by_crc32(&mut lowered.mini_map_graphics.f0);
-    Ok((DefBody::PlayerGuiDef(lowered), warnings))
+    Ok(DefBody::PlayerGuiDef(lowered))
 }
 
 fn lower_special_effects_def(
@@ -3074,7 +3058,7 @@ fn lower_special_effects_def(
     symbols: &SymbolTable,
     def_indices: &HashMap<String, u32>,
     names: &RefCell<NamesBuilder>,
-) -> Result<(DefBody, Vec<Spanned<Statement>>), LowerError> {
+) -> Result<DefBody, LowerError> {
     let base = base_or_default!(base_opt, SpecialEffectsDef);
     let mut entries = base.special_effects.f0.0.clone();
     let eval = Evaluator::new(symbols);
@@ -3095,10 +3079,10 @@ fn lower_special_effects_def(
     let mut seen = std::collections::HashSet::new();
     entries.retain(|(k, _)| seen.insert(*k));
     entries.sort_by_key(|(k, _)| *k);
-    let (mut lowered, warnings) =
+    let mut lowered =
         lower_generic::<SpecialEffectsDef>(&base, &rest, symbols, def_indices, names)?;
     lowered.special_effects.f0 = VecMap(entries);
-    Ok((DefBody::SpecialEffectsDef(lowered), warnings))
+    Ok(DefBody::SpecialEffectsDef(lowered))
 }
 
 fn lower_weapon_def(
@@ -3107,7 +3091,7 @@ fn lower_weapon_def(
     symbols: &SymbolTable,
     def_indices: &HashMap<String, u32>,
     names: &RefCell<NamesBuilder>,
-) -> Result<(DefBody, Vec<Spanned<Statement>>), LowerError> {
+) -> Result<DefBody, LowerError> {
     let base = base_or_default!(base_opt, WeaponDef);
     // `WeaponTrails[augmentation] CWeaponTrailGraphicSet(attack, knockdown)`
     // is stored SWAPPED on the wire: the map is keyed by the trail-graphic
@@ -3162,10 +3146,9 @@ fn lower_weapon_def(
     }
     // std::map<CWeaponTrailGraphicSet, …> → key-sorted (attack, knockdown).
     trails.sort_by_key(|(k, _)| (k.attack, k.knockdown));
-    let (mut lowered, warnings) =
-        lower_generic::<WeaponDef>(&base, &filtered, symbols, def_indices, names)?;
+    let mut lowered = lower_generic::<WeaponDef>(&base, &filtered, symbols, def_indices, names)?;
     lowered.weapon_trails = VecMap(trails);
-    Ok((DefBody::WeaponDef(lowered), warnings))
+    Ok(DefBody::WeaponDef(lowered))
 }
 
 fn lower_degradable_def(
@@ -3174,7 +3157,7 @@ fn lower_degradable_def(
     symbols: &SymbolTable,
     def_indices: &HashMap<String, u32>,
     names: &RefCell<NamesBuilder>,
-) -> Result<(DefBody, Vec<Spanned<Statement>>), LowerError> {
+) -> Result<DefBody, LowerError> {
     let base = base_or_default!(base_opt, DegradableDef);
     let eval = Evaluator::new(symbols);
     let mut degradations = base.degradations.clone();
@@ -3191,14 +3174,13 @@ fn lower_degradable_def(
         entry.blocks_navigation = eval.arg_bool_or(a, 3, false);
         degradations.push(entry);
     }
-    let (mut lowered, warnings) =
-        lower_generic::<DegradableDef>(&base, &rest, symbols, def_indices, names)?;
+    let mut lowered = lower_generic::<DegradableDef>(&base, &rest, symbols, def_indices, names)?;
     let gtype = lowered.graphic_type.to_i32() as u8;
     for d in degradations.iter_mut() {
         d.type_ = gtype;
     }
     lowered.degradations = degradations;
-    Ok((DefBody::DegradableDef(lowered), warnings))
+    Ok(DefBody::DegradableDef(lowered))
 }
 
 fn lower_replaceable_mesh_def(
@@ -3207,7 +3189,7 @@ fn lower_replaceable_mesh_def(
     symbols: &SymbolTable,
     def_indices: &HashMap<String, u32>,
     names: &RefCell<NamesBuilder>,
-) -> Result<(DefBody, Vec<Spanned<Statement>>), LowerError> {
+) -> Result<DefBody, LowerError> {
     let base = base_or_default!(base_opt, ReplaceableMeshDef);
     let mut meshes = base.meshes.vector.clone();
     let eval = Evaluator::new(symbols);
@@ -3225,10 +3207,10 @@ fn lower_replaceable_mesh_def(
             graphic_type: eval.arg_i32_or(a, 0, 0) as u8,
         });
     }
-    let (mut lowered, warnings) =
+    let mut lowered =
         lower_generic::<ReplaceableMeshDef>(&base, &rest, symbols, def_indices, names)?;
     lowered.meshes.vector = meshes;
-    Ok((DefBody::ReplaceableMeshDef(lowered), warnings))
+    Ok(DefBody::ReplaceableMeshDef(lowered))
 }
 
 fn lower_appearance_modifier_def(
@@ -3237,7 +3219,7 @@ fn lower_appearance_modifier_def(
     symbols: &SymbolTable,
     def_indices: &HashMap<String, u32>,
     names: &RefCell<NamesBuilder>,
-) -> Result<(DefBody, Vec<Spanned<Statement>>), LowerError> {
+) -> Result<DefBody, LowerError> {
     let base = base_or_default!(base_opt, AppearanceModifierDef);
     let mut graphics = base.graphics.graphics.clone();
     let eval = Evaluator::new(symbols);
@@ -3256,10 +3238,10 @@ fn lower_appearance_modifier_def(
         data[0x14..0x18].copy_from_slice(&eval.arg_f32_or(a, 5, 0.0).to_le_bytes());
         graphics.push(AppearanceModifierGraphicsGraphicsEntry { data });
     }
-    let (mut lowered, warnings) =
+    let mut lowered =
         lower_generic::<AppearanceModifierDef>(&base, &rest, symbols, def_indices, names)?;
     lowered.graphics.graphics = graphics;
-    Ok((DefBody::AppearanceModifierDef(lowered), warnings))
+    Ok(DefBody::AppearanceModifierDef(lowered))
 }
 
 pub fn lower_def(
@@ -3269,7 +3251,7 @@ pub fn lower_def(
     symbols: &SymbolTable,
     def_indices: &HashMap<String, u32>,
     names: &RefCell<NamesBuilder>,
-) -> Result<(DefBody, Vec<Spanned<Statement>>), LowerError> {
+) -> Result<DefBody, LowerError> {
     let body = match name {
         "CAnimatingObjectDef" => {
             lower_animating_object_def(base, body, symbols, def_indices, names)?
@@ -3288,8 +3270,8 @@ pub fn lower_def(
         "CHeroMorphDef" => lower_hero_morph_def(base, body, symbols, def_indices, names)?,
         "CLookDef" => {
             let base = base_or_default!(base, LookDef);
-            let (lowered, warnings) = lower_generic(&base, body, symbols, def_indices, names)?;
-            (DefBody::LookDef(lowered), warnings)
+            let lowered = lower_generic(&base, body, symbols, def_indices, names)?;
+            DefBody::LookDef(lowered)
         }
         "OPINION_DEED_EFFECTS" => {
             lower_opinion_deed_effects_def(base, body, symbols, def_indices, names)?

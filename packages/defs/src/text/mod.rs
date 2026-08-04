@@ -3,13 +3,13 @@ pub mod header;
 pub mod lexer;
 pub mod symbols;
 
-pub use self::base::{LineIndex, Span, Spanned};
+pub use self::base::{LineIndex, ParseContext, Span, Spanned};
 pub use self::lexer::{LexError, LexErrorKind, Lexer, TextParseErrorKind, Token, TokenKind, lex};
 pub use self::symbols::SymbolTable;
 
 use self::base::ParseError;
 use self::header::HeaderItem;
-use self::lexer::{Cursor, describe, lex_error_to_parse_error};
+use self::lexer::{Cursor, lex_error_to_parse_error};
 use std::collections::HashMap;
 #[derive(Debug, Clone, Default)]
 pub struct DefFile {
@@ -206,8 +206,8 @@ fn is_body_terminator(kind: TokenKind) -> bool {
 
 pub fn parse_def_file(input: &str) -> Result<DefFile, DefParseError> {
     let tokens = lex(input).map_err(|e| {
-        let (pos, kind) = lex_error_to_parse_error(e);
-        ParseError::new(pos, kind)
+        let (span, kind) = lex_error_to_parse_error(e);
+        ParseError::new(span, kind)
     })?;
     let mut cursor = Cursor::new(tokens);
     parse_file(&mut cursor)
@@ -217,8 +217,8 @@ pub fn parse_def_file(input: &str) -> Result<DefFile, DefParseError> {
 /// expressions without going through a full definition.
 pub fn parse_expr_str(input: &str) -> Result<Spanned<Expr>, DefParseError> {
     let tokens = lex(input).map_err(|e| {
-        let (pos, kind) = lex_error_to_parse_error(e);
-        ParseError::new(pos, kind)
+        let (span, kind) = lex_error_to_parse_error(e);
+        ParseError::new(span, kind)
     })?;
     let mut cursor = Cursor::new(tokens);
     parse_expr(&mut cursor)
@@ -241,16 +241,11 @@ fn parse_file(cursor: &mut Cursor<'_>) -> Result<DefFile, ParseError<TextParseEr
             // File-local `enum`/`#define` declarations at `.def` top level.
             // Parsed directly on the shared cursor — no clone-bridge.
             TokenKind::Enum | TokenKind::Define => {
-                file.headers
-                    .push(header::parse_item_on_cursor(cursor).map_err(|e| {
-                        let pos = e.pos;
-                        ParseError::new(
-                            pos,
-                            TextParseErrorKind::UnexpectedToken {
-                                expected: format!("enum or #define declaration: {}", e.inner),
-                            },
-                        )
-                    })?);
+                // Propagate the inner error as-is. Re-wrapping it as
+                // "expected enum or #define declaration: {inner}" produced a
+                // doubly-nested message and discarded the inner error's own
+                // span and context.
+                file.headers.push(header::parse_item_on_cursor(cursor)?);
             }
             // Stray tokens between top-level items are skipped, as the
             // pre-token parser did (its `skip_to_next_top_level_item` walked
@@ -281,16 +276,23 @@ fn parse_definition(
         }
         _ => {
             return Err(cursor.err_at(
-                header_tok.span.start,
+                header_tok.span,
                 TextParseErrorKind::UnexpectedToken {
                     expected: "#definition or #definition_template".into(),
+                    found: header_tok.kind,
                 },
             ));
         }
     };
 
     let def_type = cursor.expect_ident("definition type")?;
+    let name_span = cursor.peek().span;
     let name = cursor.expect_ident("definition name")?;
+
+    // Everything from here to `#end_definition` is "in definition `NAME`".
+    // The span is the name, not the whole header line, so the secondary label
+    // underlines what identifies the def — matching how lowering errors render.
+    let def_ctx = ParseContext::new("definition", Some(name.clone()), name_span);
 
     let specializes = if cursor.at_ident("specialises") {
         let spec_kw = cursor.bump();
@@ -318,10 +320,10 @@ fn parse_definition(
         if is_body_terminator(tk) {
             let err = cursor
                 .err(TextParseErrorKind::MissingEndDefinition)
-                .with_def_header(def_start);
+                .within(&def_ctx);
             return Err(err);
         }
-        body.push(parse_statement(cursor).map_err(|e| e.with_def_header(def_start))?);
+        body.push(parse_statement(cursor).map_err(|e| e.within(&def_ctx))?);
     };
 
     let (specializes, specializes_span) = match specializes {
@@ -398,19 +400,29 @@ fn parse_tagged_block(
     cursor: &mut Cursor<'_>,
 ) -> Result<TaggedBlock, ParseError<TextParseErrorKind>> {
     cursor.expect(TokenKind::Lt)?;
+    let tag_span = cursor.peek().span;
     let tag = cursor.expect_ident("tag name")?;
     cursor.expect(TokenKind::Gt)?;
+    // Innermost wins, so an error inside the block reports the block rather
+    // than the enclosing definition.
+    let ctx = ParseContext::new("tagged block", Some(tag.clone()), tag_span);
     let mut body = Vec::new();
     loop {
         let tk = cursor.peek().kind;
         if tk == TokenKind::Lt && cursor.peek_at(1).kind == TokenKind::Backslash {
+            let close_start = cursor.peek().span.start;
             cursor.bump(); // `<`
             cursor.bump(); // `\`
             let close_tag = cursor.expect_ident("closing tag name")?;
             cursor.expect(TokenKind::Gt)?;
             if close_tag != tag {
+                // Underline the whole `<\Tag>` closer, which is what disagrees
+                // with the opener.
                 return Err(ParseError::new(
-                    cursor.prev_end(),
+                    Span {
+                        start: close_start,
+                        end: cursor.prev_end(),
+                    },
                     TextParseErrorKind::MismatchedTag {
                         opened: tag,
                         closed: close_tag,
@@ -422,11 +434,9 @@ fn parse_tagged_block(
         // A directive/keyword, EOF, or `#end_definition` inside the block
         // means it was never closed (§11.5, strict).
         if is_body_terminator(tk) || tk == TokenKind::EndDefinition {
-            return Err(cursor.err(TextParseErrorKind::UnexpectedToken {
-                expected: format!("<\\{tag}>"),
-            }));
+            return Err(cursor.unexpected(format!("<\\{tag}>")).within(&ctx));
         }
-        body.push(parse_statement(cursor)?);
+        body.push(parse_statement(cursor).map_err(|e| e.within(&ctx))?);
     }
     Ok(TaggedBlock { tag, body })
 }
@@ -459,9 +469,7 @@ fn split_method_path(
     if let Some(PathSegment::Field(method)) = segments.pop() {
         Ok((PropertyPath { segments }, method))
     } else {
-        Err(cursor.err(TextParseErrorKind::UnexpectedToken {
-            expected: "method name".into(),
-        }))
+        Err(cursor.err(TextParseErrorKind::MethodNameIsIndex))
     }
 }
 
@@ -567,9 +575,7 @@ fn parse_leaf_expr(
                 }
             }
         }
-        _ => Err(cursor.err(TextParseErrorKind::UnexpectedToken {
-            expected: format!("expression, found {}", describe(tok.kind)),
-        })),
+        _ => Err(cursor.unexpected("expression")),
     }
 }
 
@@ -1002,7 +1008,10 @@ mod tests {
         ));
         // The error is anchored at the second `#definition` (the token that
         // revealed FIRST was never closed), not swallowed away.
-        assert_eq!(err.pos, input.find("#definition OBJECT SECOND").unwrap());
+        assert_eq!(
+            err.span.start,
+            input.find("#definition OBJECT SECOND").unwrap()
+        );
     }
 
     #[test]
