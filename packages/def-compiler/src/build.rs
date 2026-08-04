@@ -1363,8 +1363,25 @@ fn assemble_and_write(
 //  Phase 2: Build one binary
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// Identity of a merged tagged block: its tag plus the identity of each source
+/// slice. Two definitions that inherit the same block from the same template
+/// borrow the *same* statements, so this catches the duplication that matters —
+/// 33,525 sub-defs across the corpus come from ~5,700 distinct inputs — without
+/// needing to hash the statements themselves.
+type SubDefInput = (u32, Vec<(usize, usize)>);
+
+fn sub_def_input(tag_crc: u32, bodies: &MergedBlock<'_>) -> SubDefInput {
+    (
+        tag_crc,
+        bodies
+            .iter()
+            .map(|b| (b.as_ptr() as usize, b.len()))
+            .collect(),
+    )
+}
+
 /// Build the anonymous sub-def region (game.bin only).  Lowers each merged
-/// tagged block (see [`extract_sub_def_blocks`]), deduplicates anonymous
+/// tagged block (see [`collect_sub_def_blocks`]), deduplicates anonymous
 /// entries by (class-tag, bytes), and appends them to `entries`.
 fn build_subdefs(
     named_order: &[String],
@@ -1375,6 +1392,11 @@ fn build_subdefs(
     sub_blocks: &[SubDefBlocks],
 ) -> Result<(usize, usize), String> {
     let mut sub_dedup: HashMap<(String, Vec<u8>), u32> = HashMap::new();
+    // Identical inputs lower to identical bytes and intern the same (already
+    // interned) strings, so reusing the earlier result is indistinguishable
+    // from redoing the work — including for `names.bin`, since interning is
+    // idempotent.
+    let mut input_memo: HashMap<SubDefInput, u32> = HashMap::new();
     let mut sub_entries: Vec<Built> = Vec::new();
     let (mut sub_ok, mut sub_fail) = (0, 0);
     for (oi, name) in named_order.iter().enumerate() {
@@ -1387,6 +1409,15 @@ fn build_subdefs(
         for (k, tag, bodies) in blocks {
             let k = *k;
             let tag = *tag;
+            if let Some(&sub_idx) = input_memo.get(&sub_def_input(k, bodies)) {
+                sub_ok += 1;
+                table.push(SubDefRecord {
+                    name_crc: k,
+                    def_index: sub_idx,
+                    owner_index,
+                });
+                continue;
+            }
             // Concatenated only here, and dropped before the next block.
             let blk: Vec<Spanned<Statement>> =
                 bodies.iter().flat_map(|b| b.iter().cloned()).collect();
@@ -1456,6 +1487,7 @@ fn build_subdefs(
                     });
                     idx
                 });
+            input_memo.insert(sub_def_input(k, bodies), sub_idx);
             table.push(SubDefRecord {
                 name_crc: k,
                 def_index: sub_idx,
