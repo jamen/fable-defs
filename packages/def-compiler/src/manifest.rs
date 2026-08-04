@@ -1,10 +1,16 @@
 //! The only retail-derived input: per-binary **membership** and **NULLDEF
 //! lists**.
 //!
-//! Text sources can't provide these two things, so they are extracted once from
-//! the retail binaries and kept static here (regenerate with the
-//! `dump_manifest` example). Keeping them encodes the contract as
-//! *retail-equivalent* rather than *superset* — see AGENTS.md §6.
+//! Text sources can't provide these two things, so they were extracted once
+//! from the retail binaries and are kept static here. Keeping them encodes the
+//! contract as *retail-equivalent* rather than *superset* — see AGENTS.md §7.
+//!
+//! There is **no regeneration tool in this repo**. The `dump_manifest` example
+//! this comment used to point at lived in the pre-extraction OpenAlbion
+//! monorepo and did not come across. Regenerating means writing it again:
+//! read the three retail binaries, and for each emit the `NameRef` def-name
+//! list (membership) and the leading NULLDEF run (classes, in order, duplicates
+//! preserved).
 
 use defs::binary::DefBinaryHeader;
 
