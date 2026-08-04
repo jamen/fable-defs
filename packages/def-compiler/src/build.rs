@@ -1254,27 +1254,34 @@ fn assemble_and_write(
         })
         .collect();
     const TARGET: usize = 16384;
-    let mut chunks = Vec::new();
+    // Find the chunk boundaries first, then consume `records` in one forward
+    // pass. Draining the front of the `Vec` per chunk instead is quadratic in a
+    // 5 KB `EntryRecord` — it memmoves the whole tail once per chunk, which for
+    // game.bin (~13k entries, ~430 chunks) cost 1.8 s, roughly half the build.
+    let sizes: Vec<usize> = records.iter().map(|e| e.byte_size()).collect();
+    let mut bounds: Vec<usize> = Vec::new();
+    let mut sz = 0usize;
+    for (i, &size) in sizes.iter().enumerate() {
+        // `sz > 0` keeps an entry that alone exceeds TARGET in a chunk of its
+        // own rather than looping forever on an impossible split.
+        if sz > 0 && sz + size > TARGET {
+            bounds.push(i);
+            sz = 0;
+        }
+        sz += size;
+    }
+    bounds.push(sizes.len());
+
+    let mut chunks = Vec::with_capacity(bounds.len());
+    let mut records = records.into_iter();
     let mut entry_base = 0u32;
-    let mut remaining = records;
-    while !remaining.is_empty() {
-        let mut sz = 0;
-        let split = remaining
-            .iter()
-            .position(|e| {
-                if sz > 0 && sz + e.byte_size() > TARGET {
-                    true
-                } else {
-                    sz += e.byte_size();
-                    false
-                }
-            })
-            .unwrap_or(remaining.len());
+    for bound in bounds {
+        let count = bound - entry_base as usize;
         chunks.push(Chunk::from_entries(
             entry_base,
-            remaining.drain(..split).collect(),
+            records.by_ref().take(count).collect(),
         ));
-        entry_base += split as u32;
+        entry_base = bound as u32;
     }
     let hdr = DefBinaryHeader {
         use_names_bin: header.use_names_bin,

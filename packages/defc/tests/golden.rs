@@ -52,7 +52,7 @@ fn golden_output_is_stable() {
     let _ = std::fs::remove_dir_all(&out);
 
     let status = Command::new(env!("CARGO_BIN_EXE_defc"))
-        .args([text_dir.as_str(), out.to_str().unwrap()])
+        .args(["-i", text_dir.as_str(), "-o", out.to_str().unwrap()])
         .status()
         .expect("run defc");
     assert!(status.success(), "defc build failed");
