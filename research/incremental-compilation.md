@@ -1,232 +1,222 @@
 # Incremental Compilation: Research & Analysis
 
-## Summary of current state
+## Summary
 
-The full from-scratch build takes **3.5 s** on the Anniversary corpus (177 files, 10,454
-definitions, 13,239 game.bin entries). Lowering + emitting game.bin is 88% of that (3.09 s);
-parsing all files is only 10% (0.35 s). The distribution is bimodal and cache-friendly:
-93.5% of definitions are leaves (0 descendants), and only 23 definitions have ≥100 transitive
-descendants. The largest, `OBJECT_BASE`, has 3,147.
+The full build takes **3.5 s** on the Anniversary corpus (177 files, 10,454 definitions,
+13,239 game.bin entries). Lowering + emitting game.bin is 88% (3.09 s). Parsing all files is
+10% (0.35 s).
+
+The distribution is favourable: 93.5% of definitions are leaves (0 transitive descendants).
+Only 23 defs have ≥100 descendants; the largest (`OBJECT_BASE`) has 3,147.
 
 **Goal:** a `redb`-backed cache so an edit-compile cycle costs time proportional to what
-changed, not to the size of the corpus.
+changed.
 
 ---
 
-## 1. Current pipeline walkthrough
+## 1. The problem: lowered bodies are not position-independent
 
-### Phase 1: parse_corpus (build.rs:825-908)
-1. Walk `Defs/` for `.h` files → parse each into `SourceAst` → `SymbolTable::evaluate_items`
-   → one global symbol table. Header-set resolution picks one of `RetailHeaders/DevHeaders`.
-2. Walk `Defs/` for `.def`/`.tpl` files → parse each into `SourceAst`; definitions are
-   extracted, `ParsedFile` stores the full AST.
-3. Evaluate symbols from `.def`/`.tpl` files too (enums, `#define`s declared inline).
-4. Produces `ParsedCorpus { files, symbols, sources, def_to_source, def_spans }`.
+A lowered `DefBody` carries two kinds of corpus-global state:
 
-### Phase 2: build_one_bin (×3 — game, frontend, script)
-1. **Scope** files by binary (all for game, `FrontEndDefs/` for frontend, `ScriptDefs/` for script).
-2. **`defs_by_name`**: last-file-wins map of definition name → `&Definition`.
-3. **`collect_named`**: assigns global indices (NULLDEF count + position). First occurrence
-   claims the slot; duplicates in later files are skipped. Filtered by manifest membership.
-4. **`build_nulldefs`**: `lower_def(type, None, &[], ...)` → `def_default()` for each class.
-5. **`emit_nulldef_and_named`**:
-   - Emit NULLDEF entries (preamble `is_real=false`).
-   - For each named def: `flatten_specialization` (parent chain → flat `Vec<Statement>`) →
-     `lower_def` (dispatch on type name) → `Built { body: DefBody, ... }`.
-   - `NamesBuilder::intern` is called for def_name, file_name during emission; also for
-     `DefString` values inside `lower_def`.
-   - `next_class_index` assigns 0-based counter per class.
-6. **`build_subdefs`** (game.bin only): for each named entry with a sub-def table,
-   `flatten_specialization` **again**, extract tagged blocks, merge by CRC of tag, lower each,
-   dedup by `(tag, bytes)`, emit anonymous entries.
-7. **`assemble_and_write`**: chunk entries at 16 KB, zlib compress, serialize `DefBinary`.
+### 1.1 `DefIndex` = global entry index
 
-### Key observation: `flatten_specialization` is called twice per def
-Once in `emit_nulldef_and_named` for the named body, once in `build_subdefs` for sub-defs.
-This is a known cheap win (§9 AGENTS.md).
+A `DefIndex` field like `DummyObject` resolves through `def_indices: &HashMap<String, u32>`
+at lowering time. The map is built by `collect_named`, which assigns indices based on sorted
+file order. Adding or removing any earlier entry shifts every later index — invalidating every
+cached body.
+
+**Scale:** 221 DefIndex usage sites across all def structs: 195 scalar, 22 `Vec<DefIndex>`,
+3 `BTreeMap`/`VecMap<K, DefIndex>`, 1 inside a WireStruct. 88% are scalar.
+
+### 1.2 `DefString` = names.bin byte offset
+
+A `DefString` field like `Font` resolves through `names.borrow_mut().intern(s)` at lowering
+time. The byte offset depends on interning order across the entire build — adding or removing
+any string before this one shifts all later offsets.
+
+**Scale:** 204 DefString usage sites: 156 scalar, 21 `Vec<DefString>`, 7 `VecMap<K, DefString>`,
+1 `VecMap<DefString, i32>`, 13 inside WireStructs, 4 inside DefVariants, 2 `Vec<DefString>`
+inside WireStructs.
+
+### 1.3 Conclusion
+
+A cached lowered body must keep references **symbolic** (by name / by string) and resolve them
+at link time when indices and interning order are known. The mechanism for this is a
+**relocation table**.
 
 ---
 
-## 2. The two kinds of global state in lowered bodies
+## 2. Design: relocation table
 
-A lowered `DefBody` is **not position-independent**. It carries two kinds of corpus-global
-state that would be invalidated if any earlier entry in the same binary changes:
+### 2.1 Core concept
 
-### 2.1 `DefIndex` fields — global entry indices
+During lowering, whenever a `DefIndex` or `DefString` field is set, record a relocation entry:
+`(wire_field_crc, symbolic_value)`. The DefBody stores the RESOLVED values (as it does today);
+the relocation table stores what name/string produced each value.
 
-`DefIndex` is `i32` on the wire (4 bytes LE, default 0). At lowering time, a def reference
-like `DummyObject "OBJECT_BANDIT_GRUNT"` or `Children[i] OBJECT_VILLAGE_TAVERN` is resolved
-through `def_indices: &HashMap<String, u32>` — the map built by `collect_named`.
+At link time: walk the DefBody, look up each relocation entry by field CRC, resolve the
+symbolic name/string through the NEW `def_indices`/`NamesBuilder`, and overwrite the field.
 
-If a new named entry is added **before** a referenced def in the sorted file order, every
-`DefIndex` referencing it shifts by +1. This would invalidate every cached body that
-references it.
+### 2.2 Why not `LowerEnv`
 
-**Scale**: ~90 fields are `DefIndex` (mistyped ones already fixed). But any def that
-references another def — which is most of them — would be invalidated by index shifts.
+`LowerEnv` was a trait abstraction over the two concrete arguments (`def_indices` and `names`).
+It was **intentionally removed** — the two concrete arguments are simpler and equivalent. The
+relocation table is orthogonal to the lowering interface: it records what a field was set *to*,
+not what mechanism performed the resolution. No trait is needed; we just need to record at the
+points where resolution happens.
 
-### 2.2 `DefString` fields — names.bin byte offsets
+### 2.3 Recording strategy
 
-`DefString` is `i32` on the wire (default −1). At lowering time, a string like
-`Font "ENG_ARIAL_16"` or an animation key is passed to `names.borrow_mut().intern(s)`, which
-returns the byte offset in the shared `names.bin`. The offset depends on **interning order**
-across the entire build.
+Pass a `&mut RelocRecorder` through the lowering pipeline as an additional parameter alongside
+`def_indices` and `names`. At each point where a `DefIndex`/`DefString` value is resolved,
+also record the symbolic value.
 
-If a new string is interned before an existing one, every `DefString` with that offset shifts.
-This would invalidate every cached body that contains a `DefString`.
+**`RelocRecorder` is a plain struct, not a trait:**
 
-**Scale**: every lowered body that uses strings (animation names, component type names, UI
-fonts, etc.) has at least one `DefString`. That's most of them.
+```rust
+#[derive(Default)]
+pub struct RelocRecorder {
+    /// (crc32(wire_name), symbolic_def_name) — one entry per DefIndex field set.
+    /// For container elements, entries appear in the order the elements are stored.
+    def_refs: Vec<(u32, String)>,
+    /// (crc32(wire_name), symbolic_string) — one per DefString field set.
+    def_strings: Vec<(u32, String)>,
+}
+```
 
-### Conclusion
+### 2.4 Recording in the generic path (Applier)
 
-A cached lowered body must keep references **symbolic** — by name instead of by index, by
-string instead of by offset. Resolution happens at **link time** when indices and interning
-order are known. This is the compile/link split.
+There are exactly two sites in the generic lowering path:
+
+| Location | Code | Recording |
+|---|---|---|
+| `apply_expr` line 918 | `*slot = DefString(self.eval_def_string(expr)?)` | Record `(crc(wire_name), string_value)` |
+| `apply_expr` line 920 | `*slot = DefIndex(resolve_ref_i32(...)?)` | Record `(crc(wire_name), def_name)` |
+| `apply_expr` line 909 | `Enum` via `resolve_ref_i32` | Record `(crc(wire_name), def_name)` if resolved via def_indices |
+| `apply_expr` line 915 | `Flags` via `resolve_ref_i32` | Same as Enum |
+
+But `apply_expr` doesn't have the wire name — it receives a `FieldRef`. The wire name is
+available in `apply_named` (the `name: &'static str` parameter). We'd pass it through.
+
+**Better approach:** record at the `resolve_ref` / `resolve_ref_i32` / `eval_def_string`
+level, where the symbolic value is directly available from the expression being evaluated:
+
+- `resolve_ref_i32(expr)` → when a def name is found (string literal or unknown symbol),
+  extract the name from `expr` and record it.
+- `eval_def_string(expr)` → when a string literal is interned, extract the string from
+  `expr` and record it.
+
+But these functions don't know which FIELD they're resolving for. The field name (wire name)
+needs to come from the caller.
+
+**Cleanest approach: record in `apply_expr`, threading the wire name:**
+
+```rust
+// In apply_named (and all callers of apply_expr that know the name):
+fn apply_named(&mut self, name: &'static str, field: FieldRef<'_>) -> ... {
+    ...
+    if let Some(expr) = self.r.opt_expr(name) {
+        self.apply_expr(name, field, expr)?;  // pass name through
+    }
+    ...
+}
+```
+
+For container elements (`apply_from_group`, `apply_from_args`), the caller knows the parent
+field's wire name. We propagate that to `apply_expr`.
+
+### 2.5 Recording in bespoke arms
+
+The bespoke arms that resolve DefIndex/DefString directly:
+
+| Function | Line | What it resolves |
+|---|---|---|
+| `lower_ui` | 498 | `names.intern("ENG_ARIAL_16")` — hardcoded string |
+| `lower_ui` | 532, 538, 544, 560, 601, 648 | `resolve_ref` — 6 sites |
+| `lower_ui` | 552 | `names.intern(s)` — 1 site |
+| `apply_ui_state` | 673 | `def_indices.get(name)` — 1 site |
+| `apply_ui_state` | 678 | `resolve_ref` — 1 site |
+| `build_thing_components` | 2199 | `names.intern(n)` — 1 site per component |
+| `build_animation_anims` | 1767, 1781, 1931 | `names.intern` — 3 sites |
+| `anim_arg_defstring` | 1738 | `names.intern` — helper, called from build_animation_anims |
+| `lower_entity_sound_def` | 2858 | `names.intern` — 1 site |
+| `lower_flammable_def` | 2897 | `names.intern` — 1 site |
+| `try_apply_object_augmentation_particle_set` | 1307 | `names.intern` — called for string args |
+| `lower_hero_morph_def` | 2529, 2544, 2560, 2575 | `anim_arg_defstring` — 4 sites |
+| `build_nulldefs` (build.rs:1091) | — | passes through to lower_def |
+| `emit_nulldef_and_named` (build.rs:1170-1171) | 1170, 1171 | `names.intern` for NameRef fields |
+| `build_subdefs` (build.rs:1404) | 1404 | `names.intern` for sub-def tags |
+
+These sites receive `reloc: &mut RelocRecorder` and record directly. Each site already has the
+wire name (the `#[def("WireName")]` name for the field being resolved).
+
+### 2.6 Container elements
+
+For `Vec<DefIndex>`, `BTreeMap<K, DefIndex>`, etc., the relocation table records entries in
+the same order the elements are stored. At link time, the patcher iterates the container in
+the same order and resolves each relocation entry.
+
+Example: `UI.Children` is `Vec<DefIndex>`. During lowering, `lower_ui` builds the vec with
+`set_grow(&mut out.children, idx, DefIndex(value), DefIndex(0))`. The relocation table records
+entries as: `(crc("Children"), "OBJECT_X")`, `(crc("Children"), "OBJECT_Y")`, etc., in the
+order they were added.
+
+At link time, the patcher walks `Vec<DefIndex>`, resolves entry 0 → `def_indices["OBJECT_X"]`,
+entry 1 → `def_indices["OBJECT_Y"]`, and sets them.
+
+**Key invariant:** the number and order of relocation entries for a container field EXACTLY
+match the number and order of elements in that container. This holds as long as:
+
+1. Each `Add` / indexed assignment records its relocation entry.
+2. `clear()` resets both the container and the relocation entries for that wire name.
+3. Container elements are never added by the generic lowering for a field that a bespoke arm
+   also handles (the two paths are mutually exclusive — a field either goes through bespoke
+   or generic, never both).
+
+**This holds.** The generic path's `apply_vec_named` and `apply_map_named` are the sole
+producers of container elements in the generic path. The bespoke arms that handle containers
+(`lower_ui`, `build_animation_anims`, `build_thing_components`, etc.) build the containers
+explicitly and record relocations alongside.
+
+### 2.7 The CachedDef type
+
+```rust
+struct CachedDef {
+    ast_hash: u64,
+    def_type: String,
+    body_bytes: Vec<u8>,      // serialized DefBody with resolved but possibly-stale values
+    def_refs: Vec<(u32, String)>,    // (crc32(wire_name), symbolic_def_name)
+    def_strings: Vec<(u32, String)>, // (crc32(wire_name), symbolic_string)
+}
+```
+
+At link time:
+1. Deserialize `body_bytes` → `DefBody`.
+2. Walk via `visit_fields`, applying relocations: for each `(crc, symbolic_name)` entry at
+   a DefIndex field, resolve `symbolic_name` → new index via NEW `def_indices`, set.
+   For each `(crc, symbolic_string)` at a DefString field, intern `symbolic_string` via
+   NEW `NamesBuilder`, set.
+3. Re-serialize.
+4. Container elements consume relocation entries in order (consume from the front of the
+   per-wire_name list).
 
 ---
 
-## 3. The missing `LowerEnv` seam — what it was and how to restore it
+## 3. AST hashing
 
-AGENTS.md §9 says:
+### 3.1 What to hash
 
-> The pipeline once had exactly this seam — a `LowerEnv` trait with `def_index(name)` +
-> `def_string_offset(str)` — and it no longer exists: `lower_def` now takes
-> `def_indices: &HashMap<String,u32>` and `names: &RefCell<NamesBuilder>` directly.
+The lowering input is: **(type name, parent name, flattened statement list)** plus the
+symbol table. Since the symbol table is global, any change to it invalidates every cached def
+(conservative but correct; headers rarely change in practice).
 
-### Current signature (lower.rs:3251)
+Hash the def's **own** body (before flattening), plus its type name and parent name. The
+flattened body is derived from the own body + parent chain, so hashing the own body +
+parent name covers it.
 
-```rust
-pub fn lower_def(
-    name: &str,
-    base: Option<&DefBody>,
-    body: &[Spanned<Statement>],
-    symbols: &SymbolTable,
-    def_indices: &HashMap<String, u32>,   // resolves DefIndex at lower time
-    names: &RefCell<NamesBuilder>,         // interns DefString at lower time
-) -> Result<DefBody, LowerError>
-```
+### 3.2 Span exclusion
 
-And every bespoke arm, `lower_generic`, and the `Applier` struct passes `def_indices` and
-`names` through.
-
-### What the seam looked like (reconstructed from AGENTS.md description)
-
-```rust
-trait LowerEnv {
-    fn def_index(&self, name: &str) -> Option<u32>;
-    fn def_string_offset(&self, name: &str) -> u32;  // intern if needed
-}
-```
-
-### Restoration plan
-
-The simplest approach that avoids touching all ~35 bespoke arms (3,350 lines) is to **replace
-the concrete types with a trait object**:
-
-1. Define a `LowerEnv` trait in `def-compiler`:
-
-```rust
-pub trait LowerEnv {
-    /// Resolve a definition name to a symbolic reference.
-    /// Returns a SymbolicRef that represents a name → index binding.
-    fn def_ref(&self, name: &str) -> Result<SymbolicRef, LowerError>;
-    /// Intern a string for a CDefString field.
-    /// Returns a SymbolicString that represents a string → offset binding.
-    fn def_string(&self, s: &str) -> SymbolicString;
-}
-```
-
-2. Introduce opaque symbolic types that replace `DefIndex`/`DefString` in cached bodies:
-
-```rust
-/// A definition reference, resolved at link time.
-/// In a cached body, this carries the name string.
-/// In a linked body, it carries the resolved u32 index.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum SymbolicRef {
-    Unresolved(String),
-    Resolved(u32),
-}
-
-/// A CDefString, resolved at link time.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum SymbolicString {
-    Unresolved(String),
-    Resolved(i32),
-}
-```
-
-3. **But this means `DefBody` can't hold `SymbolicRef`/`SymbolicString` directly** — the
-   `DefIndex`/`DefString` types are hard-coded in the wire model generated by proc macros.
-   Changing them would mean changing every struct declaration (~273 types).
-
-**Alternative: keep `DefBody` unchanged, store resolved values, and make cache entries carry
-a separate "relocation table":**
-
-```
-CachedBody {
-    body: DefBody,           // DefIndex=0, DefString=-1 placeholders
-    def_refs: Vec<(usize, String)>,    // offset → name
-    def_strings: Vec<(usize, String)>,  // offset → string
-}
-```
-
-Where `offset` is the byte offset of each `DefIndex`/`DefString` within the serialized body.
-At link time, patch these with the resolved values, serialize, done. No schema changes needed.
-
-**This is the preferred approach.** It avoids touching any struct declarations, any proc-macro
-code, and any lowering arm. The compile phase produces a `DefBody` with placeholder indices
-(0 for `DefIndex`, −1 for `DefString`), plus a relocation table. The link phase patches.
-
-### Implementation approach for the relocation table
-
-During lowering, instead of passing `&HashMap<String, u32>` and `&RefCell<NamesBuilder>`,
-pass wrappers that:
-- For `DefIndex`: record the name → offset mapping, return 0.
-- For `DefString`: record the string → offset mapping, return −1.
-
-The `Applier` struct (lower.rs:810) and every `resolve_ref`/`eval_def_string` call site is
-one of ~15 sites that resolve DefIndex/DefString. Each needs to go through the env.
-
----
-
-## 4. AST hashing
-
-### What to hash
-
-The lowering input is: **(type name, parent name, flattened statement list)**. The output
-(position-dependent) also depends on the symbol table (for `Expr::Symbol` resolution) and the
-`LowerEnv` (for def references / strings). But the symbol table is a global input — any symbol
-change potentially affects any def, which is too broad for fine-grained invalidation.
-
-**Recommended strategy:** hash the AST of the def's own body (after flattening is excluded).
-Include the type name and parent name in the key. The symbol table is treated as a global
-input: a change to it invalidates everything. This is conservative (over-invalidates) but
-correct, and since symbol-table changes are rare (header edits), the performance cost is
-negligible.
-
-### Span exclusion
-
-`Spanned<T>: PartialEq` already ignores spans. We need a `Hash` impl that does the same.
-The AST types are:
-
-| Type | Fields for hashing |
-|---|---|
-| `Definition` | `is_template`, `def_type`, `name`, `specializes`, `body` (value only) |
-| `Statement` / `Field` / `MethodCall` / `TaggedBlock` | All non-span fields |
-| `Expr` | All variants, value-only (spans on sub-exprs in `BitOr`/`Add` ignored) |
-| `Call` | `name`, `arguments` (value only) |
-| `PathSegment` | `Field(String)` / `Index(Spanned<Expr>` — hash value of inner expr) |
-
-### Approach
-
-Add a `Hash` impl on each AST type (or use a custom `AstHasher` that skips span fields).
-Span-exclusion can be tested by inserting a comment/whitespace and asserting the hash is
-unchanged.
-
-The simplest approach: derive `Hash` but exclude `Span` from the hash. Since `Spanned<T>: PartialEq` ignores span, we can add a custom `Hash` for `Spanned` that delegates to
-`T::hash`:
+`Spanned<T>: PartialEq` already ignores spans. We need `Hash` to do the same:
 
 ```rust
 impl<T: Hash> Hash for Spanned<T> {
@@ -236,292 +226,194 @@ impl<T: Hash> Hash for Spanned<T> {
 }
 ```
 
-Then `#[derive(Hash)]` on `Definition`, `Statement`, `Field`, `MethodCall`, `TaggedBlock`,
-`Call`, `PropertyPath`, `PathSegment`, `Expr`, `EnumDecl`, `EnumVariant`, `EnumExpr`,
-`Define`, `Namespace`, `IfDef`, `Item` would work correctly.
+Then derive `Hash` on all AST types (`Definition`, `Statement`, `Field`, `MethodCall`,
+`TaggedBlock`, `Call`, `PropertyPath`, `PathSegment`, `Expr`). Test: insert a comment/blank
+line → hash unchanged.
+
+### 3.3 What goes in the key
+
+```
+Cache key: concat("def:", def_name)
+Cache value: CachedDef { ast_hash, def_type, body_bytes, def_refs, def_strings }
+```
+
+A `schema_version: u32` and `symbol_table_hash: u64` are database-level metadata. On schema
+change or symbol table change, the entire cache is invalidated.
 
 ---
 
-## 5. Specialization graph
+## 4. Specialization graph
 
-Currently, `flatten_specialization` walks the `specialises` chain on demand. This is called
-**twice per def** (once for the named body, once for sub-defs during `build_subdefs`). The
-immediate win (§9 AGENTS.md) is computing it once.
+### 4.1 Current state
 
-### Graph structure
+`flatten_specialization` (lower.rs:158) walks the `specialises` chain on demand, called
+**twice per def** — once in `emit_nulldef_and_named` for the named body, once in
+`build_subdefs` for sub-def extraction.
 
-Each def has at most one parent (`specialises`). This forms a forest (collection of trees).
-The graph is not explicitly built; each call to `flatten_specialization` (lower.rs:158)
-traverses the chain:
+### 4.2 Fix: compute once
 
-```rust
-let mut chain: Vec<&Definition> = vec![def];
-while let Some(parent_name) = &current.specializes {
-    let parent = defs_by_name.get(parent_name.as_str())?;
-    // cycle check
-    chain.push(parent);
-}
-// Reverse so most-distant-ancestor-first
-Ok(chain.iter().rev().flat_map(|d| d.body.iter().cloned()).collect())
-```
-
-### Building the graph explicitly
+Build an explicit `SpecGraph` after parsing:
 
 ```rust
 struct SpecGraph {
-    /// def name → immediate children (reverse edges)
+    /// def name → immediate children (reverse edges for cascade)
     children: HashMap<String, Vec<String>>,
-    /// def name → chain from root (most-distant-ancestor-first), including self
+    /// def name → chain of ancestor names (most-distant first), including self
     chains: HashMap<String, Vec<String>>,
 }
 ```
 
-Built once after `parse_corpus`, used by both flattening and cascade invalidation.
+`flatten_specialization` uses the precomputed chain. Cascade invalidation uses the reverse
+edges: editing a def invalidates itself + all transitive descendants.
 
-### Cascade invalidation
+### 4.3 Cache the flattened body too
 
-Editing a def's own body invalidates the def and all transitive descendants. The graph gives
-us this for free: invalidate `def` plus `descendants(def)`.
-
----
-
-## 6. redb database design
-
-### Key space
-
-```
-"schema_version"        → u32              (bump on any defs-derive or lower.rs change)
-"symbol_table_hash"     → u64              (hash of all symbol names + values)
-"def:<name>"            → CachedDef        (per-def compiled body)
-"file:<path>"           → FileEntry        (per-file parse result, optional layer)
-```
-
-### CachedDef value
-
-```rust
-struct CachedDef {
-    /// Hash of the def's own AST (span-excluding), plus type name and parent name.
-    ast_hash: u64,
-    /// Type name (needed for `lower_def` dispatch and `ClassIndex`).
-    def_type: String,
-    /// The lowered body with placeholder indices/offsets.
-    body_bytes: Vec<u8>,
-    /// Relocations: (byte_offset, def_name) for each DefIndex field.
-    def_refs: Vec<(u32, String)>,
-    /// Relocations: (byte_offset, string) for each DefString field.
-    def_strings: Vec<(u32, String)>,
-}
-```
-
-### FileEntry value (optional second layer)
-
-```rust
-struct FileEntry {
-    /// Hash of the file's text content.
-    content_hash: u64,
-    /// Serialized SourceAst (using a compact binary format, or just the text).
-    /// The text alone is sufficient since parsing is only 10% of build time.
-    text: String,
-}
-```
-
-### Database location
-
-`<output_dir>/.defcache/` or a configurable path. The cache is per-corpus (different input
-directories have different caches).
+The flattened statement list is the actual input to lowering. Caching it avoids re-computing
+the specialization chain. The `CachedDef` can optionally include the flattened body for faster
+re-lowering when the cache misses but the parent chain is unchanged.
 
 ---
 
-## 7. The compile/link split in detail
+## 5. redb database
 
-### Compile phase (produces cacheable output)
+### 5.1 Schema
 
-Input: `Definition` (AST), `SymbolTable`, type's NULLDEF base.
-
-1. `flatten_specialization` (use the pre-built graph) → `Vec<Spanned<Statement>>`.
-2. `lower_def` with a **resolving LowerEnv** that records relocations instead of resolving:
-   - `def_ref(name)` → record `(byte_offset_of_next_defindex, name)`, return 0
-   - `def_string(s)` → record `(byte_offset_of_next_defstring, s)`, return −1
-3. Serialize the lowered body (which produces the byte offsets for relocations).
-4. Return `CachedDef { ast_hash, def_type, body_bytes, def_refs, def_strings }`.
-
-**Problem:** the `LowerEnv` doesn't know the byte offset at the point of resolution. The
-`DefIndex`/`DefString` value is set during `lower_def` and only serialized later. The byte
-offset is known only after serialization.
-
-**Solution A:** During lowering, use marker values for `DefIndex`/`DefString` in the
-serialized output, then scan the serialized bytes afterward to find them and build the
-relocation table. Fragile — depends on serialization being deterministic and marker values
-not colliding with real data.
-
-**Solution B (better):** During lowering, record the *logical* relocation: which field of
-which struct was set to which name/string. Then at link time, walk the struct via reflection
-and patch the resolved values in.
-
-**Solution C (simplest):** Don't store `DefBody` in the cache at all. Store the **statement
-list** (flattened) and re-lower at link time. Lowering is the expensive part (88% of build),
-so this defeats the purpose... unless most defs are trivial (generic lowering) and re-lowering
-a single def is cheap.
-
-Wait — re-examining the numbers: the 3.09 s for game.bin lowering includes **all** 9,264
-named defs + 33,525 sub-defs. Lowering ONE def is fast. The problem is the scale.
-
-**Solution D (pragmatic):** Cache the `DefBody` with placeholder values, but instead of
-tracking byte offsets, **re-resolve** the relocations by walking the struct with reflection at
-link time. This requires a `patch_def_body` function that takes a `DefBody`, walks every
-`DefIndex`/`DefString` field via `visit_fields`, and:
-- For `DefIndex(0)`: look up the name in the relocation table, resolve to index, set.
-- For `DefString(-1)`: look up the string in the relocation table, intern, set.
-
-But we don't store WHICH name maps to WHICH field — we just have all-zero DefIndex slots. We
-don't know which def name to resolve for each slot.
-
-**Actually, we could store this:** use the reflection visitor to record the field name and
-the symbolic value during lowering. The relocation table is **keyed by field path** (crc32 of
-wire name), not by byte offset.
-
-```rust
-struct SymbolicBody {
-    body: DefBody,
-    /// Map from crc32(wire_field_name) to the def name it should resolve to.
-    def_refs: HashMap<u32, String>,
-    /// Map from crc32(wire_field_name) to the string it should intern.
-    def_strings: HashMap<u32, String>,
-}
+```
+"schema_version"      → u32
+"symbol_table_hash"   → u64
+"def:<name>"          → CachedDef (bincode-serialized)
 ```
 
-At link time, walk the `DefBody` with a visitor, and for each field whose crc matches a key
-in one of the maps, set the resolved value.
+### 5.2 Database location
 
-**This is the right approach.** It doesn't depend on serialization byte offsets and works with
-the existing reflection infrastructure.
+`<output_dir>/.defcache/` — per-corpus, so different input directories have separate caches.
 
-### Link phase (resolves symbolic → concrete)
+### 5.3 Build flow with cache
 
-1. Assign global indices to named defs (may have shifted).
-2. For each cached body, walk fields via `visit_fields`, resolve `def_refs` and `def_strings`.
-3. Intern strings into `NamesBuilder`.
-4. Serialize.
+```
+For each binary (game, frontend, script):
+  1. Scope files, build defs_by_name, assign indices (collect_named).
+  2. For each named def (in index order):
+     a. Compute AST hash (own body + type + parent).
+     b. Look up cache key "def:<name>".
+     c. If hit and ast_hash matches and symbol_table_hash matches:
+        - Deserialize CachedDef.
+        - Link: patch body_bytes using relocations + new def_indices/names.
+        - Re-serialize.
+        - Emit.
+     d. If miss:
+        - flatten_specialization (from SpecGraph).
+        - lower_def with RelocRecorder.
+        - Serialize body_bytes.
+        - Store CachedDef in cache (write-through or batch at end).
+        - Emit.
+  3. Build sub-defs (game.bin only) — always from scratch for now.
+  4. Assemble and write binary.
+```
 
 ---
 
-## 8. flatten_specialization deduplication (immediate win)
+## 6. Implementation sequence
 
-Currently runs twice per def. The fix:
-
-1. In `emit_nulldef_and_named`, save the flattened body to a side map.
-2. In `build_subdefs`, use the saved body instead of re-computing.
-
-```rust
-// In build_one_bin:
-let mut flattened_bodies: HashMap<String, Vec<Spanned<Statement>>> = HashMap::new();
-
-for name in &named_order {
-    let body = flatten_specialization(def, ctx.defs_by_name)?;
-    flattened_bodies.insert(name.clone(), body.clone());
-    // ... use body for named lowering ...
-}
-
-// In build_subdefs, use flattened_bodies instead of calling flatten_specialization again.
-```
-
-This is a no-brainer, safe (same input → same output), and the simplest thing to do first.
-
----
-
-## 9. Recommended implementation sequence
-
-### Step 0: flatten_specialization double-run fix
-Small, safe, immediate win. Measure the time saved.
-
-### Step 1: Build the specialization graph explicitly
-- Add `SpecGraph` to `ParsedCorpus` or `build_one_bin`.
+### Step 0: SpecGraph + flatten_specialization dedup
+- Build `SpecGraph` once in `parse_corpus`.
 - `flatten_specialization` uses the precomputed chain.
-- Cascade invalidation uses the reverse edges.
+- Save flattened body so `build_subdefs` doesn't re-compute.
+- Measure: reduces duplicate work, simple and safe.
 
-### Step 2: Add AST hashing
-- Implement `Hash for Spanned<T>` (excludes span).
-- Derive `Hash` on all AST types.
-- Test: insert comment → hash unchanged.
-- Hash the def's own body (not flattened), plus type name and parent name.
+### Step 1: Add `Hash for Spanned<T>` and derive Hash on AST types
+- Add the impl in `defs/src/text/base.rs`.
+- Derive `Hash` on `Definition`, `Statement`, `Field`, `MethodCall`, `TaggedBlock`, `Call`,
+  `PropertyPath`, `PathSegment`, `Expr`, `Item`, `EnumDecl`, `EnumVariant`, `EnumExpr`,
+  `Define`, `Namespace`, `IfDef`.
+- Test with a file that adds a comment → hash unchanged.
+- Also add a hash for `SourceAst` (all definitions, their own bodies).
 
-### Step 3: Restore the LowerEnv seam with relocation recording
-- Define `LowerEnv` trait with `def_ref(name) -> Result<(), LowerError>` and
-  `def_string(s) -> Result<(), LowerError>`.
-- The recording implementation writes `(crc32(wire_name), name)` to a side `Vec` and
-  returns 0/−1 for the DefIndex/DefString value.
-- Thread it through `lower_def`, `lower_generic`, `Applier`, and all bespoke arms.
-- Golden-gated: the linked output must be byte-identical to current. The recording env
-  resolves the same values as today; it just defers the intern/resolve to link time.
+### Step 2: Add RelocRecorder and thread it through lowering
+- Define `RelocRecorder` in a new `packages/def-compiler/src/reloc.rs`.
+- Thread `&mut RelocRecorder` through `lower_def`, `lower_generic`, `Applier`, and each
+  bespoke arm.
+- At each resolution point, record the symbolic value alongside the resolved value.
+- Validate: build with recording enabled, walk the result to verify relocation entries match
+  the DefBody's resolved values. Golden must stay green (recording doesn't change output).
 
-### Step 4: Define CachedDef and link-time patching
-- `SymbolicBody { body: DefBody, def_refs: HashMap<u32, String>, def_strings: HashMap<u32, String> }`.
-- `patch_body(&mut DefBody, def_refs: &HashMap<u32, String>, def_indices: &HashMap<String, u32>, names: &mut NamesBuilder)`.
-- Golden-gated: a "lower with recording, then patch" round-trip must produce the same bytes
-  as direct lowering.
+### Step 3: Implement link-time patching
+- `fn patch_body(body: &mut DefBody, relocations: &[(u32, String)], def_indices: &HashMap<String, u32>, names: &RefCell<NamesBuilder>)`.
+- Walks via `visit_fields`, matches relocation entries by wire name CRC, resolves, sets.
+- Container element handling: consume entries in order.
+- Validate: round-trip test — lower with recording, serialize, deserialize, patch with same
+  def_indices/names, serialize again. Output must be byte-identical.
 
-### Step 5: Add redb cache
-- Database at `<output>/.defcache/`.
-- Key: `def:<name>` → `CachedDef`.
-- On build: for each def, compute AST hash, check cache. If hit and symbol table unchanged,
-  skip lowering, use cached body. If miss, lower, store in cache.
-- Cascade invalidation: if a def's AST hash changed, invalidate it + all descendants.
-- Symbol table change → invalidate everything (for now; can be refined later).
+### Step 4: Add redb cache
+- Add `redb` dependency to `def-compiler`.
+- `CacheDb` wrapper: open/create at `<output>/.defcache/`.
+- Cache lookup by ast_hash + symbol_table_hash.
+- Write-through on miss.
+- Symlink or copy from previous output's cache on first build.
 
-### Step 6: File-hash layer (optional)
-- Cache parsed `SourceAst` per file. Only 10% of build time, so this is low priority.
-- Worth doing if the parse phase grows slower with larger modded corpora.
+### Step 5: Cascade invalidation
+- Use `SpecGraph` to invalidate all transitive descendants when a def's AST hash changes.
+- Initially: any symbol table change invalidates all entries.
 
----
-
-## 10. Risks and open questions
-
-### Risk: relocation correctness
-The `DefIndex(0)` sentinel is load-bearing — an unset reference is index 0, which resolves
-to the NULLDEF of that class. If a relocation is missed during patching, the output has a
-real 0 where it should have a resolved value. Golden tests catch this for the stock corpus,
-but modded defs with new references could be affected.
-
-**Mitigation:** After patching, verify that no `DefIndex` field still contains 0 when the
-relocation table has an entry for that field's CRC. The `visit_fields` walk can check this.
-
-### Risk: SymbolTable changes are coarse-grained
-Any header edit invalidates every cached def. For a typical mod, this is fine (headers rarely
-change). If it becomes a problem, track per-def symbol reads during lowering and only
-invalidate defs that read changed symbols.
-
-### Risk: Cache size
-Serialized `DefBody` for all 9,264 named defs + 33,525 sub-defs could be large. But redb is
-an on-disk database; the cache lives on disk, not in memory. Memory usage during build is
-unchanged.
-
-### Open question: sub-def caching
-Sub-defs (tagged blocks) have their own lowering and dedup. Currently 33,525 sub-defs are
-lowered per build, many duplicates. The `(tag, bytes)` dedup key means identical sub-defs
-share one entry. For caching, sub-def lowering could be cached independently or as part of the
-parent def's cache entry.
-
-**Recommendation:** Cache sub-def bodies as part of the parent's `CachedDef`. When the
-parent's AST hash is unchanged, all its sub-defs are unchanged too (since they come from
-tagged blocks in the flattened body). When the parent changes, re-lower all its sub-defs.
-
-### Open question: NamesBuilder interning order
-The `names.bin` is shared across all three binaries. Cached defs from different binaries
-intern strings in potentially different order. But since we intern at link time (after
-index assignment), this is handled correctly: the `NamesBuilder` sees all strings from all
-three binaries in the order they're emitted.
+### Step 6 (optional): File-hash layer
+- Cache parsed `SourceAst` per file. Only 10% of build time, low priority.
 
 ---
 
-## 11. Key files to modify
+## 7. What's NOT in scope (initially)
 
-| File | Changes |
+- **Sub-def caching**: tagged blocks are merged, lowered, deduped. The `(tag, bytes)` dedup
+  makes caching complex. For the MVP, sub-defs are always re-lowered from scratch. If profiling
+  shows them as dominant, cache them as part of the parent's `CachedDef` entry.
+
+- **Per-symbol invalidation**: any symbol table change invalidates everything. Refine later
+  by tracking per-def symbol reads.
+
+- **File-hash layer**: skip parsing unchanged files. Low ROI (10% of build time).
+
+- **Build assembly refactoring**: `NamesBuilder` interning for NameRef fields
+  (def_name, file_name) is not position-dependent for the cache — these are always interned at
+  link time and don't need relocation entries.
+
+---
+
+## 8. Key files to create/modify
+
+| File | Action |
 |---|---|
-| `packages/def-compiler/src/lower.rs` | `LowerEnv` trait, recording impl, threading through all arms |
-| `packages/def-compiler/src/build.rs` | SpecGraph, cache lookup, link phase, `flatten_specialization` dedup |
-| `packages/def-compiler/src/reader.rs` | Maybe nothing — `Evaluator` stays symbol-table-only |
-| `packages/defs/src/text/mod.rs` | `Hash` derives on AST types |
-| `packages/defs/src/text/base.rs` | `Hash for Spanned<T>` |
-| `packages/def-compiler/Cargo.toml` | Add `redb` dependency |
-| New: `packages/def-compiler/src/cache.rs` | `CachedDef`, `SymbolicBody`, `patch_body`, redb I/O |
-| New: `packages/def-compiler/src/graph.rs` | `SpecGraph` — explicit specialization DAG |
+| `packages/def-compiler/src/reloc.rs` | New: `RelocRecorder`, `CachedDef`, `patch_body` |
+| `packages/def-compiler/src/cache.rs` | New: redb I/O, cache lookup/write |
+| `packages/def-compiler/src/graph.rs` | New: `SpecGraph` |
+| `packages/def-compiler/src/lower.rs` | Thread `&mut RelocRecorder` through all lowering arms |
+| `packages/def-compiler/src/build.rs` | Integrate SpecGraph, cache lookup, link phase |
+| `packages/defs/src/text/base.rs` | `impl Hash for Spanned<T>` |
+| `packages/defs/src/text/mod.rs` | Derive `Hash` on AST types |
+| `packages/def-compiler/Cargo.toml` | Add `redb`, `bincode` (or `postcard`) |
+
+---
+
+## 9. Risk assessment
+
+### Risk: Missing a relocation recording site
+If a DefIndex/DefString is resolved somewhere that doesn't record into `RelocRecorder`, the
+relocation table won't have an entry for that field. At link time, the stale value is kept
+unchanged in the DefBody.
+
+**Mitigation:** A validation pass after lowering that walks the DefBody via reflection, checks
+every `DefIndex(v ≠ 0)` field against the relocation table, and reports any unmatched values.
+
+### Risk: Container element ordering mismatch
+If a bespoke arm builds a container in a different order than the relocation entries are
+recorded, the patcher will misalign.
+
+**Mitigation:** Record relocations at the EXACT same call site where the element is added.
+In the generic path, `apply_vec_named` records after `push_default` + `apply_from_group`.
+In bespoke arms, record immediately after the container mutation.
+
+### Risk: Schema version mismatch
+If the def structs change (new fields, different types), cached bytes from a previous compiler
+version are incompatible.
+
+**Mitigation:** `schema_version` in the database. Bump it manually when any `#[derive(DefStruct)]`
+or `DefBody` variant changes. The golden gate catches this because a schema change breaks
+golden too.
