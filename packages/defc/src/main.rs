@@ -10,7 +10,7 @@ use def_compiler::{BuildDiagnostic, Progress, Severity, SourceFile};
 struct Args {
     /// input directory of .def, .tpl, and .h files
     #[argh(option, short = 'i')]
-    source: Option<PathBuf>,
+    input: Option<PathBuf>,
 
     /// output directory for .bin files
     #[argh(option, short = 'o')]
@@ -81,7 +81,7 @@ fn main() {
     }
 
     let mut missing = Vec::new();
-    if args.source.is_none() {
+    if args.input.is_none() {
         missing.push("--input / -i");
     }
     if args.output.is_none() {
@@ -95,7 +95,7 @@ fn main() {
         eprintln!("\nRun defc --help for more information.");
         std::process::exit(1);
     }
-    let source = args.source.unwrap();
+    let input = args.input.unwrap();
     let output = args.output.unwrap();
 
     let mut on_progress = |event: Progress| match event {
@@ -121,7 +121,7 @@ fn main() {
         }
     };
 
-    match def_compiler::build_with_progress(&source, &output, &mut on_progress) {
+    match def_compiler::build_with_progress(&input, &output, &mut on_progress) {
         Ok(report) => {
             render(&file_store(&report.sources), &report.diagnostics);
             let summary: Vec<String> = report

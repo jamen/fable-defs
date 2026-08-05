@@ -11,14 +11,14 @@ This project is experimental. Please report any bugs you find or suggest improve
 ## Usage
 
 ```
-Usage: defc [-i <source>] [-o <output>] [--version]
+Usage: defc [-i <input>] [-o <output>] [--version]
 
 Fable def compiler
 
 Options:
-  -i, --source      input directory containing .def, .tpl, and .h files
+  -i, --input       input directory of .def, .tpl, and .h files
   -o, --output      output directory for .bin files
-  --version         print version and exit
+  --version         print version
   --help, help      display usage information
 ```
 
