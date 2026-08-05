@@ -1,6 +1,6 @@
 [package]
 name = "defc"
-description = "Fable def compiler command-line tool"
+description = "Fable def compiler"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

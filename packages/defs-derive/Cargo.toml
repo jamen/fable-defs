@@ -1,6 +1,6 @@
 [package]
 name = "defs-derive"
-description = "Procedural macro derives for the defs wire model"
+description = "Procedural macro for the def data types"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
